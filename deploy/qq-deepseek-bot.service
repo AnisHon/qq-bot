@@ -1,0 +1,18 @@
+[Unit]
+Description=QQ DeepSeek Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/anishan/project/bot
+EnvironmentFile=-/home/anishan/project/bot/.env
+ExecStart=/usr/bin/env uv run uvicorn app.main:app --host ${APP_HOST:-0.0.0.0} --port ${APP_PORT:-8080}
+SuccessExitStatus=143
+Restart=always
+RestartSec=3
+User=anishan
+Group=anishan
+
+[Install]
+WantedBy=multi-user.target

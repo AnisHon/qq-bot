@@ -1,0 +1,26 @@
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime databases, vector indexes, and logs
+data/*.db
+data/*.db-*
+data/chromadb/
+data/github_repos/
+logs/
+
+# Local datasets and generated exports
+/sfm.pdf
+*.tar.gz
+
+# Machine-specific NapCat configuration and scratch notes
+/deploy/onebot11_*.json
+/nvidia_test.py
+/task.md
+/task*.md

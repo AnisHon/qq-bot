@@ -1,0 +1,15 @@
+[Unit]
+Description=QQ DeepSeek Bot
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/anishan/project/bot
+Environment=UV_BIN=/home/anishan/.local/bin/uv
+ExecStart=/home/anishan/project/bot/scripts/run.sh
+SuccessExitStatus=143
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
