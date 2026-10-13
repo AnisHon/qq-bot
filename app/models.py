@@ -56,10 +56,3 @@ class SearchResult:
 class ChatReply:
     text: str
     should_send: bool = True
-
-
-@dataclass(frozen=True, slots=True)
-class BotCommand:
-    name: str
-    action: str = ""
-    payload: str = ""

@@ -1,20 +1,22 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 import tempfile
 from pathlib import Path
 import unittest
 
 from app.bot_service import (
     BotService,
-    _format_memory_lines,
     _looks_like_minecraft_query,
-    _parse_task_schedule,
     _sanitize_qq_text,
 )
+from app.handlers.task_handler import _parse_task_schedule
 from app.tools.external import _is_generic_news_query
 from app.config import Settings
 from app.memory import MemoryStore
-from app.models import GroupMessageEvent, QuotedMessage
+from app.models import GroupMessageEvent, QuotedMessage, SearchResult
+from app.storage_executor import StorageExecutor
 from app.text_utils import split_qq_text
 
 
@@ -43,9 +45,6 @@ print(1)
         text = _sanitize_qq_text("胖虎: 我知道了\nAI：下一句")
         self.assertEqual(text, "我知道了\n下一句")
 
-    def test_memory_format_plain_text(self) -> None:
-        text = _format_memory_lines([{"id": "1", "scope": "group", "scope_id": "100", "content": "我是服主"}])
-        self.assertEqual(text, "当前长期记忆：\n1. 我是服主")
 
     def test_identifiers_and_urls_keep_underscores(self) -> None:
         text = _sanitize_qq_text(
@@ -96,6 +95,55 @@ class CommandTest(unittest.TestCase):
             event = GroupMessageEvent("1", "100", "111", "user", "/weather 北京", False, 0, {})
             self.assertTrue(svc.expects_reply(event))
 
+    def test_non_admin_weather_command_remains_available_via_registry(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        from app.tools.cache import ToolResultCache
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(
+                bot_admin_qq_list=("administrator",),
+                sqlite_path=Path(tmpdir) / "bot.db",
+            )
+            store = MemoryStore(settings.sqlite_path, history_limit=20)
+            llm = _DummyLLM("LLM must not handle a slash command")
+            svc = BotService(settings=settings, memory=store, llm=llm)
+            event = GroupMessageEvent("cmd-1", "100", "ordinary-user", "user", "/weather 北京", False, 0, {})
+            rows = [SearchResult("北京", "晴", "", "天气")]
+            with patch("app.tools.legacy_tools.get_cache", return_value=ToolResultCache()):
+                with patch("app.tools.legacy_tools.get_weather", new=AsyncMock(return_value=rows)) as weather:
+                    reply = _run(svc.handle_group_message(event))
+
+            self.assertIn("北京", reply.text)
+            self.assertIn("晴", reply.text)
+            self.assertEqual(llm.calls, 0)
+            weather.assert_awaited_once()
+
+    def test_unknown_slash_command_is_rejected_without_entering_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(sqlite_path=Path(tmpdir) / "bot.db")
+            store = MemoryStore(settings.sqlite_path, history_limit=20)
+            llm = _DummyLLM("must not be used")
+            service = BotService(settings=settings, memory=store, llm=llm)
+            event = GroupMessageEvent("unknown-1", "100", "111", "user", "/recpie diamond", False, 0, {})
+            self.assertTrue(service.expects_reply(event))
+            reply = _run(service.handle_group_message(event))
+            self.assertIn("未知命令", reply.text)
+            self.assertIn("/recipe", reply.text)
+            self.assertEqual(llm.calls, 0)
+
+    def test_ordinary_message_still_enters_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(sqlite_path=Path(tmpdir) / "bot.db", agent_tools_enabled=False)
+            store = MemoryStore(settings.sqlite_path, history_limit=20)
+            llm = _DummyLLM("ordinary reply")
+            service = BotService(settings=settings, memory=store, llm=llm)
+            reply = _run(service.handle_group_message(
+                GroupMessageEvent("normal-1", "100", "111", "user", "请回答", True, 0, {})
+            ))
+            self.assertEqual(reply.text, "ordinary reply")
+            self.assertEqual(llm.calls, 1)
+
     def test_reply_to_bot_wakes_without_text_or_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = Settings(sqlite_path=Path(tmpdir) / "bot.db")
@@ -144,7 +192,7 @@ class CommandTest(unittest.TestCase):
                     GroupMessageEvent("1", "100", "111", "user", "/model use deepseek", True, 0, {})
                 )
             )
-            self.assertEqual(reply.text, "只有管理员可以使用管理命令。")
+            self.assertEqual(reply.text, "你没有权限执行此命令。")
 
     def test_admin_can_clear_group_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -161,7 +209,12 @@ class CommandTest(unittest.TestCase):
             store.add_message("100", "2", "u2", "user", "world")
             store.upsert_group_summary("100", "旧摘要", 2)
             reply = _run(svc.handle_group_message(GroupMessageEvent("1", "100", "1392953682", "admin", "/context clear", True, 0, {})))
-            self.assertIn("已清空本群上下文和自动摘要", reply.text)
+            self.assertIn("请确认", reply.text)
+            token = reply.text.rsplit(" ", 1)[-1]
+            reply = _run(svc.handle_group_message(
+                GroupMessageEvent("2", "100", "1392953682", "admin", f"/confirm {token}", True, 0, {})
+            ))
+            self.assertIn("已清除本群上下文", reply.text)
             self.assertEqual(store.get_recent_messages("100"), [])
             self.assertIsNone(store.get_group_summary("100"))
 
@@ -178,10 +231,10 @@ class CommandTest(unittest.TestCase):
             svc = BotService(settings=settings, memory=store, llm=_DummyLLM())
             store.add_message("100", "1", "u1", "user", "hello")
             reply = _run(svc.handle_group_message(GroupMessageEvent("1", "100", "111", "user", "/context clear", True, 0, {})))
-            self.assertEqual(reply.text, "只有管理员可以使用管理命令。")
+            self.assertEqual(reply.text, "你没有权限执行此命令。")
             self.assertIn("hello", [row["content"] for row in store.get_recent_messages("100")])
 
-    def test_admin_can_add_and_delete_multiple_memories(self) -> None:
+    def test_admin_can_add_multiline_memories_and_delete_one_scoped_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = Settings(
                 bot_admin_qq_list=("1392953682",),
@@ -197,16 +250,23 @@ class CommandTest(unittest.TestCase):
                     GroupMessageEvent("1", "100", "1392953682", "admin", "/memory add 第一条\n第二条", True, 0, {})
                 )
             )
-            self.assertIn("已添加 2 条长期记忆", reply.text)
+            self.assertIn("已添加本群长期记忆", reply.text)
             rows = store.list_memories(scope="group", scope_id="100", limit=10)
             self.assertEqual({row["content"] for row in rows}, {"第一条", "第二条"})
-            ids = " ".join(str(row["id"]) for row in rows)
             reply = _run(
                 svc.handle_group_message(
-                    GroupMessageEvent("2", "100", "1392953682", "admin", f"/memory delete {ids}", True, 0, {})
+                    GroupMessageEvent("2", "100", "1392953682", "admin", f"/memory delete {rows[0]['id']}", True, 0, {})
                 )
             )
-            self.assertIn("已删除 2 条长期记忆", reply.text)
+            self.assertIn("已删除这条", reply.text)
+            self.assertEqual(len(store.list_memories(scope="group", scope_id="100", limit=10)), 1)
+            reply = _run(svc.handle_group_message(
+                GroupMessageEvent("3", "100", "1392953682", "admin", "/memory clear", True, 0, {})
+            ))
+            token = reply.text.rsplit(" ", 1)[-1]
+            _run(svc.handle_group_message(
+                GroupMessageEvent("4", "100", "1392953682", "admin", f"/confirm {token}", True, 0, {})
+            ))
             self.assertEqual(store.list_memories(scope="group", scope_id="100", limit=10), [])
 
     def test_admin_can_add_and_delete_task(self) -> None:
@@ -221,19 +281,19 @@ class CommandTest(unittest.TestCase):
             svc = BotService(settings=settings, memory=store, llm=_DummyLLM())
             reply = _run(
                 svc.handle_group_message(
-                    GroupMessageEvent("1", "100", "1392953682", "admin", "/task add in 10m 说一句测试", True, 0, {})
+                    GroupMessageEvent("1", "100", "1392953682", "admin", '/task add "说一句测试" --in 10m', True, 0, {})
                 )
             )
-            self.assertIn("已添加定时任务", reply.text)
+            self.assertIn("已添加本群定时任务", reply.text)
             rows = store.list_scheduled_tasks("100")
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["prompt"], "说一句测试")
             reply = _run(
                 svc.handle_group_message(
-                    GroupMessageEvent("2", "100", "1392953682", "admin", f"/task delete {rows[0]['id']}", True, 0, {})
+                    GroupMessageEvent("2", "100", "1392953682", "admin", f"/task cancel {rows[0]['id']}", True, 0, {})
                 )
             )
-            self.assertIn("已删除 1 个定时任务", reply.text)
+            self.assertIn("已取消本群", reply.text)
             self.assertEqual(store.list_scheduled_tasks("100"), [])
 
     def test_old_chinese_command_is_not_management_command(self) -> None:
@@ -334,11 +394,105 @@ class _DummyLLM:
         self.reply = reply
         self.model = model
         self.api_key = "test-key"
+        self.calls = 0
 
     async def chat(self, messages, temperature=0.7, max_tokens=None):
+        self.calls += 1
         return self.reply
 
 
 def _run(coro):
-    import asyncio
     return asyncio.run(coro)
+
+
+class GroupReplyCancellationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_cancelled_reply_releases_group_busy_marker(self) -> None:
+        class BlockingLLM:
+            def __init__(self) -> None:
+                self.started = asyncio.Event()
+                self.api_key = "fixture-key"
+
+            async def chat(self, messages, temperature=0.7, max_tokens=None, **kwargs):
+                self.started.set()
+                await asyncio.Event().wait()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(
+                sqlite_path=Path(tmpdir) / "bot.db",
+                agent_tools_enabled=False,
+                agent_total_timeout=10,
+            )
+            memory = MemoryStore(settings.sqlite_path, history_limit=20)
+            llm = BlockingLLM()
+            service = BotService(settings=settings, memory=memory, llm=llm)
+            event = GroupMessageEvent("cancel-1", "group-1", "user-1", "User", "hello", True, 0, {})
+            task = asyncio.create_task(service.handle_group_message(event))
+            await llm.started.wait()
+
+            self.assertTrue(await service.is_group_busy("group-1"))
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertFalse(await service.is_group_busy("group-1"))
+
+
+class StorageOffloadIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_bot_service_memory_io_runs_off_loop_with_injected_executor(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        executor = StorageExecutor(sqlite_workers=1, vector_workers=1, queue_capacity=4)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(
+                sqlite_path=Path(tmpdir) / "bot.db",
+                agent_tools_enabled=False,
+                agent_total_timeout=10,
+            )
+            memory = MemoryStore(settings.sqlite_path, history_limit=20)
+            original_add_message = memory.add_message
+
+            def blocking_add_message(*args, **kwargs) -> None:
+                role = kwargs.get("role", args[3] if len(args) > 3 else "")
+                if role == "user" and not entered.is_set():
+                    entered.set()
+                    did_release = release.wait(timeout=0.25)
+                    if not did_release:
+                        raise RuntimeError("test did not release blocked storage fixture")
+                original_add_message(*args, **kwargs)
+                if role == "user":
+                    finished.set()
+
+            memory.add_message = blocking_add_message
+            service = BotService(
+                settings=settings,
+                memory=memory,
+                llm=_DummyLLM(),
+                storage_executor=executor,
+            )
+            task = asyncio.create_task(
+                service.handle_group_message(
+                    GroupMessageEvent("offload-1", "group-1", "user-1", "User", "hello", True, 0, {})
+                )
+            )
+            try:
+                deadline = asyncio.get_running_loop().time() + 1
+                while not entered.is_set() and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.005)
+                self.assertTrue(entered.is_set(), "storage call did not reach the blocking fixture")
+                ticks = 0
+                for _ in range(5):
+                    await asyncio.sleep(0.005)
+                    ticks += 1
+                self.assertEqual(ticks, 5)
+            finally:
+                release.set()
+
+            deadline = asyncio.get_running_loop().time() + 1
+            while not finished.is_set() and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.005)
+            self.assertTrue(finished.is_set(), "storage fixture did not finish")
+            reply = await asyncio.wait_for(task, timeout=3)
+            self.assertIsNotNone(reply)
+            self.assertEqual(reply.text, "ok")
+        await executor.aclose()

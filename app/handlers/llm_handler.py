@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime
@@ -8,19 +9,27 @@ from typing import Sequence
 from app.config import Settings
 from app.llm import DeepSeekClient
 from app.memory import MemoryStore
-from app.models import BotCommand, GroupMessageEvent, MessageAttachment, SearchResult
+from app.models import GroupMessageEvent, MessageAttachment, SearchResult
 from app.rag import RagChunk, RagStore
+from app.knowledge.documents import DocumentFilter
+from app.knowledge.retrieval import DocumentKnowledgeService
+from app.storage_executor import StorageExecutor
+from app.usage_budget import BudgetScope, current_budget_scope, reset_budget_scope, set_budget_scope
 from app.vector_rag import VectorRagStore
 from app.qq_context import format_mentions, format_quote, format_recent_context, format_recent_messages, select_recent_context
 from app.tools.agent import (
-    ToolObservation,
-    execute_tool_call as _agent_execute,
-    forced_tool_call as _make_forced_call,
-    format_tool_observations,
     run_agent_loop,
 )
+from app.tools.contracts import ToolContext, ToolError, ToolResult, ToolStatus, search_results_to_tool_result
+from app.tools.policies import group_member_policy_snapshot
 from app.tools.minecraft_wiki import search_minecraft_wiki
 from app.tools.mcbaike import search_mcbaike
+from app.repositories.local_git import LocalGitRepositoryService
+from app.recipes.query import RecipeQueryService
+from app.recipes.repository import RecipeRepository
+from app.sfm.knowledge import SFMKnowledgeService
+from app.sfm.validator import SFMValidationService
+from app.sfm.workflow import SFMGenerationWorkflow
 
 
 LOGGER = logging.getLogger(__name__)
@@ -173,6 +182,78 @@ def _format_rag_chunks(chunks: Sequence[RagChunk]) -> str:
     return "\n".join(lines)
 
 
+def _combine_knowledge_results(results: Sequence[ToolResult]) -> ToolResult:
+    if not results:
+        return ToolResult(
+            status=ToolStatus.NO_RESULTS,
+            content={"text": "没有匹配的本地或 Minecraft 资料来源。", "results": []},
+        )
+
+    rows: list[object] = []
+    evidence = []
+    text_parts: list[str] = []
+    for result in results:
+        if isinstance(result.content, dict):
+            values = result.content.get("results")
+            if isinstance(values, list):
+                rows.extend(values)
+            text = result.content.get("text")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text.strip())
+        elif isinstance(result.content, str) and result.content.strip():
+            text_parts.append(result.content.strip())
+        evidence.extend(result.evidence)
+
+    has_results = bool(rows)
+    incomplete_statuses = {
+        ToolStatus.PARTIAL,
+        ToolStatus.DATA_UNAVAILABLE,
+        ToolStatus.NOT_INDEXED,
+        ToolStatus.VERSION_MISMATCH,
+        ToolStatus.ERROR,
+        ToolStatus.TIMED_OUT,
+    }
+    partial = any(result.status in incomplete_statuses for result in results)
+    if has_results:
+        status = ToolStatus.PARTIAL if partial else ToolStatus.OK
+    else:
+        precedence = (
+            ToolStatus.ERROR,
+            ToolStatus.TIMED_OUT,
+            ToolStatus.VERSION_MISMATCH,
+            ToolStatus.DATA_UNAVAILABLE,
+            ToolStatus.NOT_INDEXED,
+            ToolStatus.PARTIAL,
+            ToolStatus.NO_RESULTS,
+        )
+        status = next(
+            (candidate for candidate in precedence if any(result.status == candidate for result in results)),
+            ToolStatus.NO_RESULTS,
+        )
+
+    errors = [result.error for result in results if result.error is not None]
+    error = None
+    if partial and errors:
+        error = ToolError(
+            "partial_knowledge_search",
+            "；".join(dict.fromkeys(item.message for item in errors)),
+            retryable=any(item.retryable for item in errors),
+        )
+    elif status in {ToolStatus.ERROR, ToolStatus.TIMED_OUT, ToolStatus.DATA_UNAVAILABLE, ToolStatus.NOT_INDEXED, ToolStatus.VERSION_MISMATCH}:
+        error = errors[0] if errors else ToolError(status.value, "资料来源不可用。")
+
+    unique_evidence = tuple(dict.fromkeys(evidence))
+    return ToolResult(
+        status=status,
+        content={
+            "text": "\n\n".join(text_parts) if text_parts else "没有找到结果。",
+            "results": rows,
+        },
+        evidence=unique_evidence[:8],
+        error=error,
+    )
+
+
 # ── Text / trigger helpers (also imported by bot_service) ────────────────────
 
 def _strip_trigger(text: str, prefix: str) -> str:
@@ -222,6 +303,15 @@ async def _safe_chat_call(client: Any, messages: list[dict[str, Any]], **kwargs:
         return await client.chat(messages, **basic_kwargs)
 
 
+async def _await_before_deadline(awaitable, deadline: float):
+    remaining = deadline - asyncio.get_running_loop().time()
+    if remaining <= 0:
+        if asyncio.iscoroutine(awaitable):
+            awaitable.close()
+        raise TimeoutError("Agent request deadline expired")
+    return await asyncio.wait_for(awaitable, timeout=remaining)
+
+
 class LLMHandler:
     def __init__(
         self,
@@ -231,6 +321,7 @@ class LLMHandler:
         rag: RagStore | None,
         vector_rag: VectorRagStore | None,
         llms: dict[str, DeepSeekClient],
+        storage_executor: StorageExecutor | None = None,
     ) -> None:
         self.settings = settings
         self.memory = memory
@@ -238,6 +329,29 @@ class LLMHandler:
         self.rag = rag
         self.vector_rag = vector_rag
         self.llms = llms
+        self.storage_executor = storage_executor
+        self.local_repository_service = LocalGitRepositoryService.from_settings(settings)
+        self.document_knowledge = DocumentKnowledgeService(
+            rag if settings.rag_enabled else None,
+            vector_rag if settings.rag_enabled else None,
+            storage_executor,
+        )
+        # Recipe tables are additive and data-free until an explicit import is activated.
+        self.recipe_query_service = RecipeQueryService(RecipeRepository(settings.sqlite_path))
+        self.sfm_knowledge_service = SFMKnowledgeService(self.document_knowledge)
+        self.sfm_validation_service = SFMValidationService()
+
+    def _sfm_generation_workflow(self, llm: DeepSeekClient) -> SFMGenerationWorkflow:
+        return SFMGenerationWorkflow(
+            llm,
+            self.sfm_knowledge_service,
+            self.sfm_validation_service,
+        )
+
+    async def _sqlite_call(self, function, /, *args, **kwargs):
+        if self.storage_executor is None:
+            return function(*args, **kwargs)
+        return await self.storage_executor.run_sqlite(function, *args, **kwargs)
 
     def _request_text(self, event: GroupMessageEvent) -> str:
         names = _unique_names(event.bot_names, self.settings.bot_default_name)
@@ -250,9 +364,11 @@ class LLMHandler:
             providers.setdefault("deepseek", self.llm)
         return providers
 
-    def _current_model_provider(self, group_id: str) -> str:
+    async def _current_model_provider(self, group_id: str) -> str:
         providers = self._available_llms()
-        selected = (self.memory.get_group_setting(group_id, "model_provider") or "").lower()
+        selected = (
+            await self._sqlite_call(self.memory.get_group_setting, group_id, "model_provider") or ""
+        ).lower()
         if selected in providers:
             return selected
         default = self.settings.default_model_provider.lower()
@@ -260,8 +376,47 @@ class LLMHandler:
             return default
         return next(iter(providers), "deepseek")
 
-    def _llm_for_group(self, group_id: str) -> DeepSeekClient:
-        return self._available_llms().get(self._current_model_provider(group_id), self.llm)
+    async def _llm_for_group(self, group_id: str) -> DeepSeekClient:
+        provider = await self._current_model_provider(group_id)
+        return self._available_llms().get(provider, self.llm)
+
+    def _tool_extensions(self, llm: DeepSeekClient) -> dict[str, object]:
+        return {
+            "local_repository_service": self.local_repository_service,
+            "local_repository_runner": (
+                self.storage_executor.run_vector if self.storage_executor is not None else None
+            ),
+            "recipe_query_service": self.recipe_query_service,
+            "recipe_query_runner": (
+                self.storage_executor.run_sqlite if self.storage_executor is not None else None
+            ),
+            "sfm_knowledge_service": self.sfm_knowledge_service,
+            "sfm_generation_workflow": self._sfm_generation_workflow(llm),
+        }
+
+    async def command_tool_context(
+        self,
+        event: GroupMessageEvent,
+        *,
+        deadline_monotonic: float,
+    ) -> ToolContext:
+        """Build the same service, permission, and budget context used by Agent tools."""
+        llm = await self._llm_for_group(event.group_id)
+        budget_scope = current_budget_scope()
+        return ToolContext(
+            request_id=budget_scope.request_id if budget_scope is not None else event.message_id,
+            group_id=str(event.group_id),
+            user_id=str(event.user_id),
+            deadline_monotonic=deadline_monotonic,
+            cancel_scope=asyncio.current_task(),
+            policy_snapshot=group_member_policy_snapshot(event, self.settings),
+            budget_scope=budget_scope,
+            budget_controller=getattr(llm, "budget_controller", None),
+            evidence_limit=8,
+            tool_timeout_seconds=self.settings.network_tool_timeout,
+            result_max_chars=self.settings.agent_tool_results_max_chars,
+            extensions=self._tool_extensions(llm),
+        )
 
     def _fallback_llm(self, active: DeepSeekClient) -> DeepSeekClient | None:
         return None
@@ -273,22 +428,32 @@ class LLMHandler:
     async def _reply_with_llm(
         self,
         event: GroupMessageEvent,
-        forced_tool: BotCommand | None = None,
         on_tool_call=None,
     ) -> str:
-        llm = self._llm_for_group(event.group_id)
+        deadline = asyncio.get_running_loop().time() + self.settings.agent_total_timeout
+        llm = await self._llm_for_group(event.group_id)
+        policy_snapshot = group_member_policy_snapshot(event, self.settings)
+        budget_scope = current_budget_scope()
         query = self._request_text(event)
-        if forced_tool is not None and forced_tool.payload.strip():
-            query = forced_tool.payload.strip()
         if not query and event.attachments:
             query = "用户发送了附件。"
         if not query:
             query = "用户唤醒了你，但没有提出具体问题。请简短询问需要什么。"
 
-        recent = self._recent_context_rows(event)
-        memories = self.memory.list_memories(scope="group", scope_id=event.group_id, limit=self.settings.memory_query_limit)
+        recent = await self._recent_context_rows(event)
+        memories = await self._sqlite_call(
+            self.memory.list_memories,
+            scope="group",
+            scope_id=event.group_id,
+            limit=self.settings.memory_query_limit,
+        )
         if event.user_id and event.user_id != self.settings.bot_qq_id:
-            user_memories = self.memory.list_memories(scope="user", scope_id=event.user_id, limit=5)
+            user_memories = await self._sqlite_call(
+                self.memory.list_memories,
+                scope="user",
+                scope_id=event.user_id,
+                limit=5,
+            )
             memories.extend(user_memories)
 
         current_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z (UTC%z)")
@@ -303,7 +468,7 @@ class LLMHandler:
                 ),
             },
         ]
-        summary = self.memory.get_group_summary(event.group_id)
+        summary = await self._sqlite_call(self.memory.get_group_summary, event.group_id)
         if summary and summary.get("summary"):
             messages.append(
                 {
@@ -355,40 +520,6 @@ class LLMHandler:
             "frequency_penalty": self.settings.default_frequency_penalty,
         }
 
-        if forced_tool is not None:
-            explicit_call = _make_forced_call(forced_tool.action, forced_tool.payload)
-            if explicit_call:
-                if on_tool_call is not None:
-                    try:
-                        await on_tool_call()
-                    except Exception:  # noqa: BLE001
-                        pass
-                try:
-                    obs = await _agent_execute(explicit_call, timeout=self.settings.network_tool_timeout)
-                    observations: list[ToolObservation] = [obs]
-                except Exception as exc:  # noqa: BLE001
-                    LOGGER.warning("explicit tool %s failed: %s", explicit_call.name, exc)
-                    observations = []
-                if observations:
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": format_tool_observations(
-                                observations,
-                                max_chars=self.settings.agent_tool_results_max_chars,
-                            ),
-                        }
-                    )
-            try:
-                reply = await _safe_chat_call(llm, messages, **chat_kwargs)
-            except Exception as exc:  # noqa: BLE001
-                fallback = self._fallback_llm(llm)
-                if fallback is None:
-                    raise
-                LOGGER.warning("selected model failed, falling back to DeepSeek: %s", exc)
-                reply = await _safe_chat_call(fallback, messages, **chat_kwargs)
-            return _sanitize_qq_text(reply)
-
         if self.settings.agent_tools_enabled:
             original_messages = [dict(message) for message in messages]
             reply = await run_agent_loop(
@@ -405,6 +536,9 @@ class LLMHandler:
                 frequency_penalty=self.settings.default_frequency_penalty,
                 on_tool_call=on_tool_call,
                 local_knowledge_search=self._search_local_knowledge,
+                tool_extensions=self._tool_extensions(llm),
+                deadline=deadline,
+                policy_snapshot=policy_snapshot,
             )
             fallback = self._fallback_llm(llm)
             if fallback is not None and self._agent_failed(reply):
@@ -423,24 +557,33 @@ class LLMHandler:
                     frequency_penalty=self.settings.default_frequency_penalty,
                     on_tool_call=on_tool_call,
                     local_knowledge_search=self._search_local_knowledge,
+                    tool_extensions=self._tool_extensions(fallback),
+                    deadline=deadline,
+                    policy_snapshot=policy_snapshot,
                 )
             if self._agent_failed(reply):
                 raise RuntimeError(reply)
             return _sanitize_qq_text(reply)
 
         try:
-            reply = await _safe_chat_call(llm, messages, **chat_kwargs)
+            reply = await _await_before_deadline(
+                _safe_chat_call(llm, messages, **chat_kwargs),
+                deadline,
+            )
         except Exception as exc:  # noqa: BLE001
             fallback = self._fallback_llm(llm)
             if fallback is None:
                 raise
             LOGGER.warning("selected model failed, falling back to DeepSeek: %s", exc)
-            reply = await _safe_chat_call(fallback, messages, **chat_kwargs)
+            reply = await _await_before_deadline(
+                _safe_chat_call(fallback, messages, **chat_kwargs),
+                deadline,
+            )
         return _sanitize_qq_text(reply)
 
-    def _recent_context_rows(self, event: GroupMessageEvent) -> list[dict[str, str]]:
+    async def _recent_context_rows(self, event: GroupMessageEvent) -> list[dict[str, str]]:
         limit = self.settings.context_recent_message_limit
-        rows = self.memory.get_recent_messages(event.group_id, limit + 1)
+        rows = await self._sqlite_call(self.memory.get_recent_messages, event.group_id, limit + 1)
         current_content = _message_content_for_memory(event)
         if rows:
             last = rows[-1]
@@ -452,51 +595,20 @@ class LLMHandler:
                 rows = rows[:-1]
         return select_recent_context(rows, event.user_id, limit)
 
-    async def _search_local_knowledge(self, query: str) -> list[SearchResult]:
-        results: list[SearchResult] = []
+    async def _search_local_knowledge(self, query: str) -> ToolResult:
+        source_results: list[ToolResult] = []
         if _looks_like_sfm_query(query):
-            for chunk in self._maybe_search_sfm(query):
-                results.append(
-                    SearchResult(
-                        title=f"SFM 用法资料，第 {chunk.page} 页",
-                        summary=chunk.content,
-                        url="",
-                        source="本地SFM文档",
-                    )
-                )
-        if _looks_like_minecraft_query(query):
-            results.extend(await self._maybe_search_minecraft(query))
-        return results[:8]
-
-    def _maybe_search_sfm(self, query: str) -> list[RagChunk]:
-        if not self.rag or not self.settings.rag_enabled:
-            return []
-        if not _looks_like_sfm_query(query):
-            return []
-        try:
-            results = self.rag.search(
-                query,
-                document_name=self.settings.rag_document_name,
-                limit=self.settings.rag_query_limit,
-            )
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("SFM RAG search failed: %s", exc)
-            results = []
-        if self.vector_rag and self.settings.rag_enabled and _looks_like_sfm_query(query):
-            try:
-                vec_chunks = self.vector_rag.search(
+            source_results.append(
+                await self.document_knowledge.search(
                     query,
-                    document_name=self.settings.rag_document_name,
+                    DocumentFilter(document_id=self.settings.rag_document_name),
                     limit=self.settings.rag_query_limit,
+                    evidence_limit=8,
                 )
-                seen = {c.chunk_id for c in results}
-                for c in vec_chunks:
-                    if c.chunk_id not in seen:
-                        results.append(c)
-                        seen.add(c.chunk_id)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("VectorRag search failed: %s", exc)
-        return results[: self.settings.rag_query_limit * 2]
+            )
+        if _looks_like_minecraft_query(query):
+            source_results.append(search_results_to_tool_result(await self._maybe_search_minecraft(query)))
+        return _combine_knowledge_results(source_results)
 
     async def _maybe_search_minecraft(self, query: str) -> list[SearchResult]:
         if not _looks_like_minecraft_query(query):
@@ -514,15 +626,16 @@ class LLMHandler:
 
     async def maybe_update_group_summary(self, group_id: str) -> None:
         try:
-            if self.memory.count_group_history(group_id) < self.settings.summary_trigger_message_count:
+            if await self._sqlite_call(self.memory.count_group_history, group_id) < self.settings.summary_trigger_message_count:
                 return
-            rows = self.memory.get_messages_for_summary(
+            rows = await self._sqlite_call(
+                self.memory.get_messages_for_summary,
                 group_id,
                 keep_recent=self.settings.context_recent_message_limit,
             )
             if not rows:
                 return
-            old_summary = self.memory.get_group_summary(group_id)
+            old_summary = await self._sqlite_call(self.memory.get_group_summary, group_id)
             old_text = old_summary["summary"] if old_summary else "无"
             transcript = _format_summary_rows(rows)
             last_message_id = int(rows[-1]["id"])
@@ -546,13 +659,22 @@ class LLMHandler:
                     ),
                 },
             ]
-            summary_llm = self._llm_for_group(group_id)
-            summary = _sanitize_qq_text(await summary_llm.chat(messages, temperature=0.2))
+            summary_llm = await self._llm_for_group(group_id)
+            budget_token = set_budget_scope(
+                BudgetScope(
+                    group_id=str(group_id),
+                    request_id=f"group-summary-{group_id}-{last_message_id}",
+                )
+            )
+            try:
+                summary = _sanitize_qq_text(await summary_llm.chat(messages, temperature=0.2))
+            finally:
+                reset_budget_scope(budget_token)
             if len(summary) > self.settings.summary_max_chars:
                 summary = summary[: self.settings.summary_max_chars].rstrip()
-            if not self.memory.message_exists(group_id, last_message_id):
+            if not await self._sqlite_call(self.memory.message_exists, group_id, last_message_id):
                 return
-            self.memory.upsert_group_summary(group_id, summary, last_message_id)
-            self.memory.delete_messages_through(group_id, last_message_id)
+            await self._sqlite_call(self.memory.upsert_group_summary, group_id, summary, last_message_id)
+            await self._sqlite_call(self.memory.delete_messages_through, group_id, last_message_id)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("failed to update group summary for %s: %s", group_id, exc)

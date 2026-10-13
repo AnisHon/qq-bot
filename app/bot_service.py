@@ -11,10 +11,12 @@ from typing import Any
 from app.config import Settings
 from app.llm import DeepSeekClient
 from app.memory import MemoryStore
-from app.models import BotCommand, ChatReply, GroupMessageEvent
+from app.models import ChatReply, GroupMessageEvent
 from app.rag import RagStore
 from app.vector_rag import VectorRagStore
-from app.handlers.command_handler import CommandHandler, _format_memory_lines
+from app.storage_executor import StorageExecutor
+from app.usage_budget import BudgetScope, reset_budget_scope, set_budget_scope
+from app.commands.service import CommandService
 from app.handlers.llm_handler import (
     LLMHandler,
     _format_rag_chunks,
@@ -28,7 +30,6 @@ from app.handlers.llm_handler import (
     _strip_trigger,
     _unique_names,
 )
-from app.handlers.task_handler import _parse_task_schedule
 
 
 LOGGER = logging.getLogger(__name__)
@@ -42,16 +43,33 @@ class BotService:
     rag: RagStore | None = None
     llms: dict[str, DeepSeekClient] = field(default_factory=dict)
     vector_rag: VectorRagStore | None = None
+    storage_executor: StorageExecutor | None = None
     _active_groups: set[str] = field(default_factory=set, init=False, repr=False)
     _active_guard: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-    _command_handler: Any = field(default=None, init=False, repr=False)
+    _command_service: Any = field(default=None, init=False, repr=False)
     _llm_handler: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._command_handler = CommandHandler(self.settings, self.memory, self.llm, self.llms)
         self._llm_handler = LLMHandler(
-            self.settings, self.memory, self.llm, self.rag, self.vector_rag, self.llms
+            self.settings,
+            self.memory,
+            self.llm,
+            self.rag,
+            self.vector_rag,
+            self.llms,
+            storage_executor=self.storage_executor,
         )
+        self._command_service = CommandService(
+            self.settings,
+            self.memory,
+            self._llm_handler,
+            storage_executor=self.storage_executor,
+        )
+
+    async def _storage_call(self, function, /, *args, **kwargs):
+        if self.storage_executor is None:
+            return function(*args, **kwargs)
+        return await self.storage_executor.run_sqlite(function, *args, **kwargs)
 
     async def handle_group_message(
         self,
@@ -62,13 +80,13 @@ class BotService:
             return None
 
         command_text = self._request_text(event)
-        command = self._parse_command(command_text)
-        forced_tool = command if command and command.name == "tool" else None
-        if command is not None and forced_tool is None:
-            return self._command_handler.handle_command(event, command)
+        if self._command_service.is_command_text(command_text):
+            result = await self._command_service.dispatch(event, command_text, on_tool_call=on_tool_call)
+            return self._command_service.renderer.render(result)
 
         memory_content = _message_content_for_memory(event)
-        self.memory.add_message(
+        await self._storage_call(
+            self.memory.add_message,
             group_id=event.group_id,
             user_id=event.user_id,
             nickname=event.nickname,
@@ -76,22 +94,32 @@ class BotService:
             content=memory_content,
         )
 
-        if forced_tool is None and not self._should_reply(event):
+        if not self._should_reply(event):
             return None
 
         if not await self._try_begin_group_reply(event.group_id):
             return ChatReply(text="我正在回答上一条问题，先不切换话题。请稍后再问我。")
 
+        budget_token = set_budget_scope(
+            BudgetScope(
+                group_id=str(event.group_id),
+                user_id=str(event.user_id) if event.user_id else None,
+                request_id=str(event.message_id),
+            )
+        )
         try:
             try:
                 reply_text = await self._llm_handler._reply_with_llm(
-                    event, forced_tool=forced_tool, on_tool_call=on_tool_call
+                    event, on_tool_call=on_tool_call
                 )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("LLM reply failed: %s", exc)
                 reply_text = _friendly_llm_failure(exc)
+            finally:
+                reset_budget_scope(budget_token)
             if reply_text:
-                self.memory.add_message(
+                await self._storage_call(
+                    self.memory.add_message,
                     group_id=event.group_id,
                     user_id=self.settings.bot_qq_id or "bot",
                     nickname="bot",
@@ -118,11 +146,13 @@ class BotService:
     def expects_reply(self, event: GroupMessageEvent) -> bool:
         if not event.text.strip():
             return bool((event.attachments and event.is_at_bot) or (event.quote and event.quote.is_from_bot))
-        command_text = self._request_text(event)
-        command = self._parse_command(command_text)
-        if command is not None:
+        if self.is_command_event(event):
             return True
         return self._should_reply(event)
+
+    def is_command_event(self, event: GroupMessageEvent) -> bool:
+        """Identify slash commands after the same trigger stripping used for routing."""
+        return self._command_service.is_command_text(self._request_text(event))
 
     def _event_bot_names(self, event: GroupMessageEvent) -> tuple[str, ...]:
         return _unique_names(event.bot_names, self.settings.bot_default_name)
@@ -166,8 +196,16 @@ class BotService:
             raw_event={"scheduled_task_id": task["id"]},
             bot_names=(self.settings.bot_default_name,),
         )
+        budget_token = set_budget_scope(
+            BudgetScope(
+                group_id=group_id,
+                user_id=str(task["created_by"]) if task.get("created_by") else None,
+                request_id=f"scheduled-task-{task['id']}",
+            )
+        )
         try:
-            self.memory.add_message(
+            await self._storage_call(
+                self.memory.add_message,
                 group_id=event.group_id,
                 user_id=event.user_id,
                 nickname=event.nickname,
@@ -175,7 +213,8 @@ class BotService:
                 content=prompt,
             )
             reply_text = await self._llm_handler._reply_with_llm(event, on_tool_call=on_tool_call)
-            self.memory.add_message(
+            await self._storage_call(
+                self.memory.add_message,
                 group_id=event.group_id,
                 user_id=self.settings.bot_qq_id or "bot",
                 nickname="bot",
@@ -184,60 +223,8 @@ class BotService:
             )
             return reply_text
         finally:
+            reset_budget_scope(budget_token)
             await self._end_group_reply(group_id)
 
     async def maybe_update_group_summary(self, group_id: str) -> None:
         await self._llm_handler.maybe_update_group_summary(group_id)
-
-    def _parse_command(self, text: str) -> BotCommand | None:
-        cleaned = text.strip()
-        if not cleaned.startswith("/"):
-            return None
-
-        first_line, _, rest = cleaned.partition("\n")
-        parts = first_line.split(maxsplit=2)
-        root = parts[0].lower()
-        action = parts[1].lower() if len(parts) >= 2 else ""
-        inline_payload = parts[2] if len(parts) >= 3 else ""
-        payload = "\n".join(item for item in [inline_payload, rest] if item).strip()
-
-        if root in {"/help", "/commands"}:
-            return BotCommand("help")
-        if root in {"/weather", "/news", "/web"}:
-            tool_payload = first_line[len(parts[0]):].strip()
-            if rest:
-                tool_payload = "\n".join(item for item in [tool_payload, rest] if item).strip()
-            return BotCommand("tool", root.removeprefix("/"), tool_payload)
-        if root == "/memory":
-            if action in {"add", "set"}:
-                return BotCommand("memory", "add", payload)
-            if action in {"delete", "del", "remove", "rm"}:
-                return BotCommand("memory", "delete", payload)
-            if action == "list":
-                return BotCommand("memory", "list")
-            if action == "clear":
-                return BotCommand("memory", "clear")
-            return BotCommand("unknown")
-        if root == "/context" and action == "clear":
-            return BotCommand("context", "clear")
-        if root == "/summary" and action in {"show", "clear"}:
-            return BotCommand("summary", action)
-        if root in {"/context", "/summary"}:
-            return BotCommand("unknown")
-        if root == "/task":
-            if action in {"add", "set"}:
-                return BotCommand("task", "add", payload)
-            if action == "list":
-                return BotCommand("task", "list")
-            if action in {"delete", "del", "remove", "rm"}:
-                return BotCommand("task", "delete", payload)
-            if action == "clear":
-                return BotCommand("task", "clear")
-            return BotCommand("unknown")
-        if root == "/model":
-            if action in {"show", "list"}:
-                return BotCommand("model", action)
-            if action in {"use", "set"}:
-                return BotCommand("model", "use", payload)
-            return BotCommand("unknown")
-        return None
