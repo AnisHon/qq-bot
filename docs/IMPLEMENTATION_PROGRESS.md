@@ -87,3 +87,11 @@ P6 状态说明：P6-01 缺 GTNH Wiki / 任务书及许可；P6-02 缺真实配�
 - P0-05 独立复核：生产 `create_app()` 路径确实传入执行器；所有检索到的 async Store 调用点均走 SQLite/vector lane，CLI 和无 executor 的旧 BotService 单测仍可使用同步 API。SQLite worker 默认串行，允许配置最多 4 个；Chroma / embedding 串行。`asyncio.wait` 取消不取消输入 Future，运行中的同步函数不能被 Python 强制停止；超过 shutdown grace 会留有后台线程风险并记录日志。测试仅为 Fake blocking work、临时 SQLite、Mock / 本地 Fixture，不涉及 Chroma 模型加载、真实向量库压力或生产流量。
 - P0-05 检查点：`app/storage_executor.py`、`app/config.py`、`app/main.py`、`app/bot_service.py`、`app/handlers/llm_handler.py`、`app/rag.py`、`tests/test_storage_executor.py`、`tests/test_bot_service.py`、`tests/test_main.py`、`tests/test_rag.py`；无 commit（工作区原有未跟踪 docs，`.git` 只读）。
 - P0-06 启动：依照预算合同先核对 `app/llm.py` 的 `chat` / `chat_with_tools` / `chat_stream` 实际 HTTP 请求与内部 retry，及 `MemoryStore` schema / transaction pattern；目标是每一次 provider dispatch 单独准入与预留，公开方法签名不变，token / fee unknown 不伪造。
+
+## 2026-10-13：Command System V2 推送与远端检查
+
+- 用户明确授权后，将改动分为三批提交并推送到 `origin/main`：`704f4f5`（运行时与知识服务）、`1ae2c5d`（Command System V2）、`b988fa8`（架构与实施文档）。远端部署仓库 `/home/anishan/project/bot` 快进至 `b988fa8`，工作树干净；依赖文件没有变化。
+- 本地 `uv run --no-sync python -m unittest discover -s tests -q`：319 tests OK；远端 Python 3.12 `compileall app` 通过。
+- 重启 `qq-deepseek-bot.service` 后服务 active，NapCat 容器 running，`/health` HTTP 200。无认证的 `/onebot/event` 返回 401。
+- `/ready` 返回 503 `onebot_callback_auth_not_configured`。`NATCAPQQ_CALLBACK_TOKEN` 尚未配置；新版本按 fail-closed 规则拒绝回调，因此不能确认真实 QQ 命令已端到端可用。需要维护者在 Bot 服务环境与 NapCat 回调 Authorization 配置相同的密钥后再重启并复测；密钥值不得写入仓库或日志。
+- 本轮未查看或输出密钥、未发送 QQ 群消息、未调用模型 API、未修改 NapCat 配置或生产密钥。真实 GTNH 数据与 SFM Parser 仍未接入。
