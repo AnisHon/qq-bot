@@ -63,7 +63,7 @@ def _split_page(text: str, max_chars: int = 900, overlap: int = 120) -> list[str
     return chunks
 
 
-def index_pdf(pdf_path: Path, sqlite_path: Path, document_name: str = "sfm") -> int:
+def _parse_pdf(pdf_path: Path, document_name: str) -> tuple[Path, str, list[tuple[str, int, str, str]]]:
     pdf_path = pdf_path.resolve()
     digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
     reader = PdfReader(str(pdf_path))
@@ -74,8 +74,18 @@ def index_pdf(pdf_path: Path, sqlite_path: Path, document_name: str = "sfm") -> 
             chunk_id = f"{document_name}:p{page_index}:c{chunk_index}"
             title = f"SFM 用法说明 第 {page_index} 页"
             chunks.append((chunk_id, page_index, title, chunk))
+    return pdf_path, digest, chunks
+
+
+def preview_pdf(pdf_path: Path, document_name: str = "sfm") -> int:
+    """Parse a PDF and report its prospective chunk count without writing indexes."""
+    _resolved_path, _digest, chunks = _parse_pdf(pdf_path, document_name)
+    return len(chunks)
+
+
+def index_pdf(pdf_path: Path, sqlite_path: Path, document_name: str = "sfm") -> int:
+    pdf_path, digest, chunks = _parse_pdf(pdf_path, document_name)
     store = RagStore(sqlite_path)
-    chunks_for_vector = chunks
     n = store.replace_document(document_name, pdf_path, digest, chunks)
     print(f"FTS index: {n} chunks stored.")
 
@@ -83,7 +93,7 @@ def index_pdf(pdf_path: Path, sqlite_path: Path, document_name: str = "sfm") -> 
     try:
         from app.vector_rag import VectorRagStore
         vector_store = VectorRagStore(sqlite_path.parent / "chromadb")
-        chunk_list = [(cid, page, title, text) for cid, page, title, text in chunks_for_vector]
+        chunk_list = [(cid, page, title, text) for cid, page, title, text in chunks]
         n_vec = vector_store.upsert_chunks(document_name, chunk_list)
         print(f"Vector index: {n_vec} chunks embedded.")
     except Exception as exc:
@@ -91,15 +101,72 @@ def index_pdf(pdf_path: Path, sqlite_path: Path, document_name: str = "sfm") -> 
     return n
 
 
+def delete_document_indexes(
+    sqlite_path: Path,
+    document_name: str,
+    *,
+    rag_store: RagStore | None = None,
+    vector_store=None,
+) -> int:
+    """Delete both local indexes, reporting partial completion for safe retry."""
+    failures: list[str] = []
+    if rag_store is None:
+        try:
+            rag_store = RagStore(sqlite_path)
+        except Exception:
+            failures.append("SQLite/FTS initialization")
+    if vector_store is None:
+        try:
+            from app.vector_rag import VectorRagStore
+            vector_store = VectorRagStore(sqlite_path.parent / "chromadb")
+        except Exception:
+            failures.append("Chroma initialization")
+
+    deleted_chunks = 0
+    if rag_store is not None:
+        try:
+            deleted_chunks = rag_store.delete_document(document_name)
+        except Exception:
+            failures.append("SQLite/FTS deletion")
+    if vector_store is not None:
+        try:
+            vector_store.delete_document(document_name)
+        except Exception:
+            failures.append("Chroma deletion")
+
+    if failures:
+        raise RuntimeError(
+            "partial document deletion; failed steps: " + ", ".join(failures)
+        )
+    return deleted_chunks
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Index sfm.pdf into SQLite RAG tables")
     parser.add_argument("pdf", nargs="?", default="sfm.pdf")
     parser.add_argument("--db", default=None)
     parser.add_argument("--name", default="sfm")
+    parser.add_argument("--delete", action="store_true", help="delete this document from SQLite/FTS and Chroma")
+    parser.add_argument("--dry-run", action="store_true", help="show the planned index or delete without changing indexes")
     args = parser.parse_args()
 
     settings = Settings.from_env()
     sqlite_path = Path(args.db) if args.db else settings.sqlite_path
+    if args.delete:
+        if args.dry_run:
+            print(f"Dry run: would delete {args.name} from SQLite/FTS and Chroma; no changes made.")
+            return
+        try:
+            deleted_chunks = delete_document_indexes(sqlite_path, args.name)
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(1) from exc
+        print(f"Deleted {args.name}: {deleted_chunks} SQLite chunks and its Chroma collection.")
+        return
+    if args.dry_run:
+        count = preview_pdf(Path(args.pdf), args.name)
+        print(f"Dry run: {args.name} would index {count} chunks from {Path(args.pdf)} into {sqlite_path}; no changes made.")
+        return
     count = index_pdf(Path(args.pdf), sqlite_path, args.name)
     print(f"indexed {count} chunks into {sqlite_path}")
 

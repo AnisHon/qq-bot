@@ -1,0 +1,136 @@
+{
+  "fixture_notice": "Hand-authored synthetic contract fixture only. This is not GTNH, Minecraft pack, or exporter data.",
+  "fixture_id": "synthetic-recipe-contract-v1",
+  "datasets": [
+    {
+      "dataset_id": "synthetic-recipes-pack-v1",
+      "pack_key": {
+        "pack_id": "synthetic-pack",
+        "pack_version": "fixture-v1",
+        "game_version": "fixture-game"
+      },
+      "source_revision": "synthetic-fixture-v1",
+      "records": [
+        {
+          "source_record_id": "row-exact-mixed",
+          "source_pointer": "/datasets/0/records/0",
+          "recipe": {
+            "recipe_id": "synthetic:final-from-ore",
+            "machine_ids": ["synthetic:assembler"],
+            "inputs": [
+              {"kind": "item_exact", "value": "synthetic:copper_ore", "amount": "2", "unit": "item", "role": "material", "consumed": true, "interpretation": "exact"},
+              {"kind": "fluid_exact", "value": "synthetic:water", "amount": "250", "unit": "mB", "role": "material", "consumed": true, "interpretation": "exact"},
+              {"kind": "item_exact", "value": "synthetic:reusable_pattern", "amount": "1", "unit": "item", "role": "tool", "consumed": false, "interpretation": "exact"}
+            ],
+            "outputs": [
+              {"kind": "item_exact", "value": "synthetic:final_component", "amount": "1", "unit": "item", "probability": "0.25", "interpretation": "exact"},
+              {"kind": "fluid_exact", "value": "synthetic:clean_water", "amount": "50", "unit": "mB", "probability": "0.8", "interpretation": "exact"}
+            ],
+            "energy_eut": 32,
+            "duration_ticks": 40
+          },
+          "unknown_fields": {}
+        },
+        {
+          "source_record_id": "row-conditional-ingredients",
+          "source_pointer": "/datasets/0/records/1",
+          "recipe": {
+            "recipe_id": "synthetic:final-from-conditional-ore",
+            "machine_ids": ["synthetic:assembler", "synthetic:precision_assembler"],
+            "inputs": [
+              {"kind": "tag", "value": "forge:ores/copper", "amount": "1", "unit": "item", "role": "material", "consumed": true, "constraints": null, "interpretation": "conditional", "source_fields": {"source_type": "item_tag"}},
+              {"kind": "ore_dictionary", "value": "oreCopper", "amount": "1", "unit": "item", "role": "material", "consumed": true, "interpretation": "conditional", "source_fields": {"source_type": "ore_dictionary"}},
+              {"kind": "predicate", "value": "synthetic:hot_material", "amount": "1", "unit": "item", "role": "condition", "consumed": null, "constraints": {"predicate": {"temperature_min_c": 400}}, "interpretation": "conditional", "source_fields": {"source_type": "predicate"}},
+              {"kind": "item_exact", "value": "synthetic:precision_circuit", "amount": "1", "unit": "item", "role": "material", "consumed": true, "constraints": {"nbt": {"grade": 2}, "components": {"synthetic:quality": "hot"}}, "interpretation": "conditional", "source_fields": {"source_type": "constrained_item"}}
+            ],
+            "outputs": [
+              {"kind": "item_exact", "value": "synthetic:final_component", "amount": "1", "unit": "item", "probability": "1", "interpretation": "exact"},
+              {"kind": "fluid_exact", "value": "synthetic:acid_byproduct", "amount": "125", "unit": "mB", "probability": "0.5", "interpretation": "exact"}
+            ],
+            "energy_eut": 64,
+            "duration_ticks": 80
+          },
+          "unknown_fields": {}
+        },
+        {
+          "source_record_id": "row-preserved-unknown",
+          "source_pointer": "/datasets/0/records/2",
+          "recipe": {
+            "recipe_id": "synthetic:final-with-extra-metadata",
+            "machine_ids": ["synthetic:assembler"],
+            "inputs": [],
+            "outputs": [
+              {"kind": "item_exact", "value": "synthetic:final_component", "amount": "2", "unit": "item", "probability": "1", "interpretation": "exact"}
+            ],
+            "energy_eut": 16,
+            "duration_ticks": 20
+          },
+          "unknown_fields": {"future_exporter_metadata": {"opaque_flag": true, "source_value": "preserve-without-interpreting"}}
+        },
+        {
+          "source_record_id": "row-unsupported-critical",
+          "source_pointer": "/datasets/0/records/3",
+          "recipe": {
+            "recipe_id": "synthetic:critical-unknown-condition",
+            "machine_ids": ["synthetic:assembler"],
+            "inputs": [
+              {"kind": "item_exact", "value": "synthetic:known_input", "amount": "1", "unit": "item", "role": "material", "consumed": true, "interpretation": "exact"}
+            ],
+            "outputs": [
+              {"kind": "item_exact", "value": "synthetic:final_component", "amount": "1", "unit": "item", "probability": "1", "interpretation": "exact"}
+            ],
+            "energy_eut": null,
+            "duration_ticks": null
+          },
+          "unknown_fields": {"opaque_critical_condition": {"gate_id": "future_mod:unknown_gate"}},
+          "critical_unknown_fields": ["opaque_critical_condition"]
+        },
+        {
+          "source_record_id": "row-unsupported-extension",
+          "source_pointer": "/datasets/0/records/4",
+          "recipe": {
+            "recipe_id": "synthetic:unsupported-source-extension",
+            "machine_ids": ["synthetic:assembler"],
+            "inputs": [
+              {"kind": "source_extension", "value": "future_mod:unknown_gate", "amount": null, "unit": null, "role": "condition", "consumed": null, "interpretation": "unsupported", "source_fields": {"opaque_gate": {"mode": "unknown"}}}
+            ],
+            "outputs": [
+              {"kind": "item_exact", "value": "synthetic:final_component", "amount": "1", "unit": "item", "probability": "1", "interpretation": "exact"}
+            ],
+            "energy_eut": null,
+            "duration_ticks": null
+          },
+          "unknown_fields": {}
+        }
+      ]
+    },
+    {
+      "dataset_id": "synthetic-recipes-pack-v2",
+      "pack_key": {
+        "pack_id": "synthetic-pack",
+        "pack_version": "fixture-v2",
+        "game_version": "fixture-game"
+      },
+      "source_revision": "synthetic-fixture-v2",
+      "records": [
+        {
+          "source_record_id": "row-v2-different-output",
+          "source_pointer": "/datasets/1/records/0",
+          "recipe": {
+            "recipe_id": "synthetic:final-v2",
+            "machine_ids": ["synthetic:advanced_assembler"],
+            "inputs": [
+              {"kind": "item_exact", "value": "synthetic:advanced_circuit", "amount": "2", "unit": "item", "role": "material", "consumed": true, "interpretation": "exact"}
+            ],
+            "outputs": [
+              {"kind": "item_exact", "value": "synthetic:final_component", "amount": "4", "unit": "item", "probability": "1", "interpretation": "exact"}
+            ],
+            "energy_eut": 128,
+            "duration_ticks": 30
+          },
+          "unknown_fields": {}
+        }
+      ]
+    }
+  ]
+}

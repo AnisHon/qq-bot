@@ -1,11 +1,79 @@
 from __future__ import annotations
 
+import os
 import unittest
+from unittest.mock import patch
 
+from app.config import Settings
 from app.natcapqq_adapter import NatcapQQAdapter
 
 
 class NatcapQQAdapterTest(unittest.TestCase):
+    def test_callback_token_config_defaults_to_unconfigured(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.natcapqq_callback_token, "")
+
+    def test_callback_token_config_trims_outer_whitespace(self) -> None:
+        with patch.dict(os.environ, {"NATCAPQQ_CALLBACK_TOKEN": " configured "}, clear=True):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.natcapqq_callback_token, "configured")
+
+    def test_settings_repr_omits_api_keys_and_tokens(self) -> None:
+        settings = Settings(
+            deepseek_api_key="model-secret",
+            deepseek_base_url="https://user:password@example.invalid/",
+            natcapqq_api_token="napcat-secret",
+            network_proxy_url="http://user:password@proxy.invalid",
+            natcapqq_callback_token="callback-secret",
+        )
+
+        rendered = repr(settings)
+        self.assertNotIn("model-secret", rendered)
+        self.assertNotIn("password", rendered)
+        self.assertNotIn("napcat-secret", rendered)
+        self.assertNotIn("callback-secret", rendered)
+
+    def test_callback_token_missing_fails_closed(self) -> None:
+        adapter = NatcapQQAdapter("http://127.0.0.1:3000")
+
+        self.assertFalse(adapter.callback_auth_configured)
+        self.assertFalse(adapter.verify_callback_token({}))
+        self.assertFalse(adapter.verify_callback_token({"Authorization": "anything"}))
+
+    def test_whitespace_callback_token_fails_closed(self) -> None:
+        adapter = NatcapQQAdapter("http://127.0.0.1:3000", callback_token=" \t ")
+
+        self.assertFalse(adapter.callback_auth_configured)
+        self.assertFalse(adapter.verify_callback_token({"Authorization": " \t "}))
+
+    def test_wrong_callback_token_is_rejected(self) -> None:
+        adapter = NatcapQQAdapter("http://127.0.0.1:3000", callback_token="expected")
+
+        self.assertFalse(adapter.verify_callback_token({"Authorization": "wrong"}))
+        self.assertFalse(adapter.verify_callback_token({"Authorization": "Bearer wrong"}))
+
+    def test_callback_token_accepts_bearer_and_raw_header_case_insensitively(self) -> None:
+        adapter = NatcapQQAdapter("http://127.0.0.1:3000", callback_token="expected")
+
+        self.assertTrue(adapter.verify_callback_token({"Authorization": "Bearer expected"}))
+        self.assertTrue(adapter.verify_callback_token({"AUTHORIZATION": "bEaReR expected"}))
+        self.assertTrue(adapter.verify_callback_token({"authorization": "expected"}))
+
+    def test_adapter_repr_omits_api_credentials_and_callback_token(self) -> None:
+        adapter = NatcapQQAdapter(
+            "http://example.invalid",
+            api_token="napcat-secret",
+            callback_token="callback-secret",
+        )
+
+        rendered = repr(adapter)
+        self.assertNotIn("napcat-secret", rendered)
+        self.assertNotIn("callback-secret", rendered)
+        self.assertNotIn("example.invalid", rendered)
+
     def test_array_message_group_event(self) -> None:
         adapter = NatcapQQAdapter("http://127.0.0.1:3000", bot_qq_id="123")
         event = adapter.parse_group_event(

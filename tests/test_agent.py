@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
+import time
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
 from app.llm import ChatWithToolsResponse, ToolCallRequest
 from app.models import SearchResult
+from app.tools.agent import TOOL_REGISTRY
+from app.tools.contracts import search_results_to_tool_result
 from app.tools.agent import _parse_dsml_tool_calls, _tool_call_message, _tool_signature, _validate_research_answer, run_agent_loop
 
 
@@ -26,6 +31,25 @@ class _FakeLLM:
 
     async def chat(self, messages, temperature=0.7, max_tokens=None):
         return "降级回答"
+
+
+class _ToolRequestLLM:
+    def __init__(self, tool_count: int = 2) -> None:
+        self.tool_count = tool_count
+        self.chat_called = False
+
+    async def chat_with_tools(self, messages, tools, temperature=0.25, **kwargs):
+        return ChatWithToolsResponse(
+            text=None,
+            tool_calls=[
+                ToolCallRequest(f"call-{index}", "weather", f'{{"location":"城市{index}"}}')
+                for index in range(self.tool_count)
+            ],
+        )
+
+    async def chat(self, messages, temperature=0.7, max_tokens=None, **kwargs):
+        self.chat_called = True
+        return "final"
 
 
 class AgentLoopTest(IsolatedAsyncioTestCase):
@@ -76,7 +100,12 @@ class AgentLoopTest(IsolatedAsyncioTestCase):
     async def test_every_tool_call_gets_a_response_when_round_is_capped(self) -> None:
         messages = [{"role": "user", "content": "查询多个城市天气"}]
         result = [SearchResult("天气", "晴", "", "天气")]
-        with patch("app.tools.agent._execute_native_tool_call", new=AsyncMock(return_value=result)):
+        weather_spec = TOOL_REGISTRY.get("weather")
+
+        async def fake_weather(context, arguments):
+            return search_results_to_tool_result(result)
+
+        with patch.dict(TOOL_REGISTRY._specs, {"weather": replace(weather_spec, handler=fake_weather)}):
             answer = await run_agent_loop(
                 _FakeLLM(),
                 messages,
@@ -91,3 +120,163 @@ class AgentLoopTest(IsolatedAsyncioTestCase):
         self.assertEqual(answer, "最终回答")
         tool_ids = [message["tool_call_id"] for message in messages if message["role"] == "tool"]
         self.assertEqual(tool_ids, ["call-0", "call-1", "call-2"])
+
+    async def test_total_deadline_cancels_all_parallel_tools_and_caps_tool_timeout(self) -> None:
+        llm = _ToolRequestLLM()
+        started = 0
+        all_started = asyncio.Event()
+        cancelled: set[str] = set()
+        passed_timeouts: list[float] = []
+
+        async def blocking_tool(context, arguments):
+            nonlocal started
+            started += 1
+            passed_timeouts.append(
+                min(context.tool_timeout_seconds, context.deadline_monotonic - asyncio.get_running_loop().time())
+            )
+            if started == 2:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.add(context.request_id)
+                raise
+
+        started_at = time.monotonic()
+        weather_spec = TOOL_REGISTRY.get("weather")
+        with patch.dict(TOOL_REGISTRY._specs, {"weather": replace(weather_spec, handler=blocking_tool)}):
+            with self.assertRaises(TimeoutError):
+                await run_agent_loop(
+                    llm,
+                    [{"role": "user", "content": "test"}],
+                    max_rounds=2,
+                    max_calls_per_round=2,
+                    max_total_calls=2,
+                    total_timeout=0.08,
+                    tool_timeout=10,
+                    results_max_chars=2000,
+                )
+
+        self.assertTrue(all_started.is_set())
+        self.assertEqual(cancelled, {"agent-call-0", "agent-call-1"})
+        self.assertTrue(all(0 < timeout < 10 for timeout in passed_timeouts))
+        self.assertLess(time.monotonic() - started_at, 0.5)
+
+    async def test_progress_notification_is_inside_request_deadline(self) -> None:
+        llm = _ToolRequestLLM(tool_count=1)
+        notice_started = asyncio.Event()
+        notice_cancelled = asyncio.Event()
+        tool = AsyncMock()
+
+        async def blocking_notice(*_args):
+            notice_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                notice_cancelled.set()
+                raise
+
+        weather_spec = TOOL_REGISTRY.get("weather")
+        with patch.dict(TOOL_REGISTRY._specs, {"weather": replace(weather_spec, handler=tool)}):
+            with self.assertRaises(TimeoutError):
+                await run_agent_loop(
+                    llm,
+                    [{"role": "user", "content": "test"}],
+                    max_rounds=1,
+                    max_calls_per_round=1,
+                    max_total_calls=1,
+                    total_timeout=0.02,
+                    tool_timeout=1,
+                    results_max_chars=2000,
+                    on_tool_call=blocking_notice,
+                )
+
+        self.assertTrue(notice_started.is_set())
+        self.assertTrue(notice_cancelled.is_set())
+        tool.assert_not_awaited()
+
+    async def test_total_deadline_cancels_model_call_and_skips_final_call(self) -> None:
+        class BlockingModel(_ToolRequestLLM):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+
+            async def chat_with_tools(self, messages, tools, temperature=0.25, **kwargs):
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+
+        llm = BlockingModel()
+        with self.assertLogs("app.tools.agent", level="WARNING"):
+            result = await run_agent_loop(
+                llm,
+                [{"role": "user", "content": "test"}],
+                max_rounds=1,
+                max_calls_per_round=1,
+                max_total_calls=1,
+                total_timeout=0.02,
+                tool_timeout=1,
+                results_max_chars=2000,
+            )
+        self.assertTrue(llm.started.is_set())
+        self.assertTrue(llm.cancelled.is_set())
+        self.assertFalse(llm.chat_called)
+        self.assertIn("Agent deadline expired", result)
+
+    async def test_external_cancellation_cleans_up_parallel_tools(self) -> None:
+        llm = _ToolRequestLLM()
+        all_started = asyncio.Event()
+        started = 0
+        cancelled: set[str] = set()
+
+        async def blocking_tool(context, arguments):
+            nonlocal started
+            started += 1
+            if started == 2:
+                all_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.add(context.request_id)
+                raise
+
+        weather_spec = TOOL_REGISTRY.get("weather")
+        with patch.dict(TOOL_REGISTRY._specs, {"weather": replace(weather_spec, handler=blocking_tool)}):
+            task = asyncio.create_task(
+                run_agent_loop(
+                    llm,
+                    [{"role": "user", "content": "test"}],
+                    max_rounds=2,
+                    max_calls_per_round=2,
+                    max_total_calls=2,
+                    total_timeout=10,
+                    tool_timeout=10,
+                    results_max_chars=2000,
+                )
+            )
+            await all_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(cancelled, {"agent-call-0", "agent-call-1"})
+
+    async def test_expired_deadline_does_not_start_a_three_second_final_call(self) -> None:
+        llm = _ToolRequestLLM(tool_count=0)
+        result = await run_agent_loop(
+            llm,
+            [{"role": "user", "content": "test"}],
+            max_rounds=0,
+            max_calls_per_round=1,
+            max_total_calls=1,
+            total_timeout=10,
+            tool_timeout=1,
+            results_max_chars=2000,
+            deadline=asyncio.get_running_loop().time() - 1,
+        )
+        self.assertFalse(llm.chat_called)
+        self.assertIn("Agent deadline expired", result)

@@ -1,0 +1,2 @@
+SYNTHETIC_FIXTURE_ONLY: rejected by an exact-match FakeSFMValidator test.
+This text is not an SFM program and the fixture diagnostic is not parser output.

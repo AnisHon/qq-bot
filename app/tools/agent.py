@@ -9,17 +9,17 @@ from typing import Any, Mapping
 
 from app.llm import ChatWithToolsResponse, DeepSeekClient, ToolCallRequest
 from app.models import SearchResult
-from app.tools.cache import get_cache
-from app.tools.external import (
-    fetch_web_page,
-    get_weather,
-    inspect_github_repository,
-    multi_search,
-    read_github_file,
-    search_github_repositories,
-    search_news,
-    search_web,
+from app.tools.contracts import (
+    PolicySnapshot,
+    ToolContext,
+    ToolResult,
+    ToolStatus,
+    format_search_results,
+    tool_result_to_search_results,
 )
+from app.tools.legacy_tools import build_legacy_tool_specs
+from app.tools.registry import ToolRegistry
+from app.usage_budget import current_budget_scope
 
 
 LOGGER = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ LOGGER = logging.getLogger(__name__)
 
 # ── OpenAI-style tool definitions sent to the model ──────────────────────────
 
-TOOL_DEFINITIONS: list[dict[str, Any]] = [
+_LEGACY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -216,9 +216,152 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "repository_search",
+            "description": (
+                "Search files or UTF-8 text in an administrator-approved local Git repository. "
+                "The result includes a full commit snapshot; pass it to repository_read to inspect the same revision."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "query": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "mode": {"type": "string", "enum": ["path", "text"]},
+                    "commit_sha": {"type": "string", "maxLength": 64},
+                    "offset": {"type": "integer"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["repo_id", "query", "mode"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "repository_read",
+            "description": (
+                "Read a bounded one-based line range from a regular UTF-8 file in an approved local Git repository. "
+                "Use the full commit_sha returned by repository_search to keep citations on the same revision."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "commit_sha": {"type": "string", "minLength": 40, "maxLength": 64},
+                    "path": {"type": "string", "minLength": 1, "maxLength": 4096},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                },
+                "required": ["repo_id", "commit_sha", "path", "start_line", "end_line"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recipe_lookup",
+            "description": (
+                "Query exact item or fluid producers/consumers in an explicitly named, active modpack and game version. "
+                "Never omit or infer versions. Tag, Ore Dictionary, predicate, or unresolved conditions are not exact matches."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pack_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "pack_version": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "game_version": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "identifier": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "kind": {"type": "string", "enum": ["item", "fluid"]},
+                    "direction": {"type": "string", "enum": ["produces", "consumes"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 100000},
+                },
+                "required": ["pack_id", "pack_version", "game_version", "identifier", "kind", "direction"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recipe_machine_lookup",
+            "description": (
+                "List recipes declared for an exact machine ID in an explicitly named, active modpack and game version. "
+                "Do not infer support from another version; report conditional recipe requirements and evidence."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pack_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "pack_version": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "game_version": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "machine_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 100000},
+                },
+                "required": ["pack_id", "pack_version", "game_version", "machine_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sfm_examples",
+            "description": (
+                "Search locally indexed SFM documentation and examples for an exact SFM release and Minecraft version. "
+                "The result may contain synthetic test fixtures; it is not parser validation. "
+                "Never substitute a different version when the requested corpus is missing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "sfm_version": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "minecraft_version": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                "required": ["query", "sfm_version", "minecraft_version"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sfm_generate_validate",
+            "description": (
+                "Generate a bounded SFM program for an exact SFM and Minecraft version using indexed examples, "
+                "then validate it and make at most two repairs. If no compatible Parser is configured, stop and "
+                "report validation unavailable. Fake validation is explicitly simulated. The program is never executed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "minLength": 1, "maxLength": 2000},
+                    "sfm_version": {"type": "string", "minLength": 1, "maxLength": 64},
+                    "minecraft_version": {"type": "string", "minLength": 1, "maxLength": 64},
+                },
+                "required": ["description", "sfm_version", "minecraft_version"],
+                "additionalProperties": False,
+            },
+        },
+    },
 ]
 
-TOOL_NAMES = {t["function"]["name"] for t in TOOL_DEFINITIONS}
+def _build_legacy_registry() -> ToolRegistry:
+    return ToolRegistry(build_legacy_tool_specs(_LEGACY_TOOL_DEFINITIONS), frozen=True)
+
+
+TOOL_REGISTRY = _build_legacy_registry()
+# Compatibility facade: this value is now generated from registered specs.
+TOOL_DEFINITIONS = TOOL_REGISTRY.openai_schemas()
+TOOL_NAMES = TOOL_REGISTRY.names()
 
 
 async def _safe_chat(client: Any, messages: list[dict[str, Any]], **kwargs: Any) -> str:
@@ -254,6 +397,9 @@ async def run_agent_loop(
     frequency_penalty: float = 0.2,
     on_tool_call=None,
     local_knowledge_search=None,
+    tool_extensions: Mapping[str, Any] | None = None,
+    deadline: float | None = None,
+    policy_snapshot: PolicySnapshot | None = None,
 ) -> str:
     """Agentic tool-use loop using DeepSeek native function calling.
 
@@ -269,18 +415,33 @@ async def run_agent_loop(
     references: list[tuple[int, str, str]] = []
     progress_stage = ""
     progress_count = 0
-    deadline = asyncio.get_running_loop().time() + total_timeout
+    loop = asyncio.get_running_loop()
+    deadline = deadline if deadline is not None else loop.time() + total_timeout
+    if policy_snapshot is None:
+        # Backward-compatible direct callers represent the existing public
+        # group-member Agent path. Application callers pass an event snapshot.
+        policy_snapshot = PolicySnapshot(roles=frozenset({"group_member"}))
+    budget_scope = current_budget_scope()
+    allowed_names = TOOL_REGISTRY.names(
+        policy_snapshot,
+        group_id=budget_scope.group_id or "" if budget_scope is not None else "",
+        user_id=budget_scope.user_id or "" if budget_scope is not None else "",
+    )
 
     for _round in range(max_rounds):
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 1:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
             break
         try:
             response = await asyncio.wait_for(
                 _safe_chat_with_tools(
                     llm,
                     messages,
-                    tools=TOOL_DEFINITIONS,
+                    tools=TOOL_REGISTRY.openai_schemas(
+                        policy_snapshot,
+                        group_id=budget_scope.group_id or "" if budget_scope is not None else "",
+                        user_id=budget_scope.user_id or "" if budget_scope is not None else "",
+                    ),
                     temperature=min(temperature, 0.5),
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
@@ -317,9 +478,16 @@ async def run_agent_loop(
             progress_stage = stage
             progress_count += 1
             try:
-                await on_tool_call(progress_text)
+                callback = on_tool_call(progress_text)
             except TypeError:
-                await on_tool_call()
+                callback = on_tool_call()
+            try:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError("Agent deadline expired before progress notification")
+                await asyncio.wait_for(callback, timeout=remaining)
+            except TimeoutError:
+                raise
             except Exception:  # noqa: BLE001
                 pass
 
@@ -339,7 +507,7 @@ async def run_agent_loop(
         skipped: dict[str, str] = {}
         for tc in response.tool_calls:
             signature = _tool_signature(tc)
-            if tc.name not in TOOL_NAMES:
+            if tc.name not in allowed_names:
                 skipped[tc.id] = f"未知工具：{tc.name}。"
             elif signature in seen_calls:
                 skipped[tc.id] = "该工具调用与之前重复，已跳过。请使用已有结果。"
@@ -350,35 +518,97 @@ async def run_agent_loop(
             else:
                 seen_calls.add(signature)
                 valid_calls.append(tc)
-        results = await asyncio.gather(
-            *[
-                _execute_native_tool_call(
-                    tc,
-                    timeout=tool_timeout,
-                    local_knowledge_search=local_knowledge_search,
-                )
-                for tc in valid_calls
-            ],
-            return_exceptions=True,
+        # This workflow returns source code and performs several bounded model
+        # calls. Run it by itself so the response cap preserves its full source;
+        # skipped calls still receive one result per tool_call_id and can be
+        # retried by the Agent in a later round.
+        generation_call = next(
+            (call for call in valid_calls if call.name == "sfm_generate_validate"),
+            None,
         )
+        if generation_call is not None:
+            for call in valid_calls:
+                if call.id != generation_call.id:
+                    skipped[call.id] = (
+                        "SFM 生成与验证工作流单独运行；请在下一轮提出其他工具调用。"
+                    )
+                    # The call was deferred, not executed or deduplicated. Let
+                    # the model retry it after receiving the SFM result.
+                    seen_calls.discard(_tool_signature(call))
+            valid_calls = [generation_call]
+        remaining = deadline - loop.time()
+        if valid_calls and remaining <= 0:
+            raise TimeoutError("Agent deadline expired before tool execution")
+        per_result_chars = (
+            max(400, results_max_chars)
+            if generation_call is not None
+            else max(400, results_max_chars // max(len(valid_calls), 1))
+        )
+        tool_tasks = [
+            asyncio.create_task(
+                _dispatch_registered_tool_call(
+                    llm,
+                    tc,
+                    deadline=deadline,
+                    tool_timeout=tool_timeout,
+                    result_max_chars=per_result_chars,
+                    policy_snapshot=policy_snapshot,
+                    local_knowledge_search=local_knowledge_search,
+                    tool_extensions=tool_extensions,
+                ),
+                name=f"agent-tool-{index}",
+            )
+            for index, tc in enumerate(valid_calls)
+        ]
+        try:
+            if tool_tasks:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError("Agent deadline expired while scheduling tools")
+                _done, pending = await asyncio.wait(tool_tasks, timeout=remaining)
+                if pending:
+                    raise TimeoutError("Agent deadline expired while tools were running")
+                results = await asyncio.gather(*tool_tasks, return_exceptions=True)
+                if any(isinstance(result, TimeoutError) for result in results):
+                    raise TimeoutError("Agent deadline expired while tools were running")
+            else:
+                results = []
+        except (asyncio.CancelledError, TimeoutError):
+            for task in tool_tasks:
+                if not task.done():
+                    task.cancel()
+            if tool_tasks:
+                await asyncio.gather(*tool_tasks, return_exceptions=True)
+            raise
         executed_calls += len(valid_calls)
 
-        per_result_chars = max(400, results_max_chars // max(len(valid_calls), 1))
         for tc, result in zip(valid_calls, results):
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 content = f"工具 {tc.name} 执行出错: {result}"
                 LOGGER.warning("tool %s failed: %s", tc.name, result)
             else:
-                content = _format_tool_result(result, max_chars=per_result_chars)
-                for item in result:
-                    if item.url and not item.title.endswith("失败"):
-                        if item.source in {"GitHub仓库文件", "GitHub文件", "网页读取"}:
+                content = _format_tool_observation(result, per_result_chars)
+                for item in result.evidence:
+                    is_document = item.kind == "document" and bool(item.locator)
+                    is_web_source = item.locator.startswith(("http://", "https://"))
+                    is_recipe_source = item.kind == "recipe" and bool(item.locator)
+                    if is_document or is_web_source or (
+                        item.kind == "repository_file" and item.locator.startswith("git://")
+                    ) or is_recipe_source:
+                        if tc.name == "sfm_generate_validate" and is_document:
+                            # Preserve every retrieved SFM source in the final
+                            # citations even when earlier tools already added
+                            # references. SFM retrieval is bounded to 8 items.
+                            priority = -1
+                        elif is_document or item.kind in {"repository_file", "web_page"}:
                             priority = 0
-                        elif item.source == "GitHub仓库":
+                        elif is_recipe_source:
+                            priority = 0
+                        elif item.kind == "repository":
                             priority = 1
                         else:
                             priority = 2
-                        reference = (priority, item.title, item.url)
+                        reference = (priority, item.title, item.locator)
                         if reference not in references:
                             references.append(reference)
             messages.append(
@@ -408,7 +638,10 @@ async def run_agent_loop(
     LOGGER.debug("agent_loop hit max_rounds=%d, requesting final answer", max_rounds)
     try:
         final_messages = _build_final_answer_messages(messages, results_max_chars * 2)
-        final_timeout = max(3.0, min(15.0, deadline - asyncio.get_running_loop().time()))
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError("Agent deadline expired before final response")
+        final_timeout = min(15.0, remaining)
         final = await asyncio.wait_for(
             _safe_chat(
                 llm,
@@ -427,88 +660,37 @@ async def run_agent_loop(
         return last_text or f"（工具执行完毕，但生成最终回复失败: {exc}）"
 
 
-async def _execute_native_tool_call(
-    tc: ToolCallRequest,
-    timeout: float,
+async def _dispatch_registered_tool_call(
+    llm: Any,
+    call: ToolCallRequest,
+    *,
+    deadline: float,
+    tool_timeout: float,
+    result_max_chars: int,
+    policy_snapshot: PolicySnapshot | None = None,
     local_knowledge_search=None,
-) -> list[SearchResult]:
-    """Parse the tool call's JSON arguments and dispatch to the right function."""
-    try:
-        args: dict[str, Any] = json.loads(tc.arguments)
-    except json.JSONDecodeError:
-        args = {}
-
-    name = tc.name
-    cache = get_cache()
-    _do_cache = name not in {"knowledge_search", "fetch_url", "github_read_file"}
-    if _do_cache:
-        _cached = cache.get(name, args)
-        if _cached is not None:
-            return _cached
-
-    if name == "knowledge_search":
-        if local_knowledge_search is None:
-            return [SearchResult("本地知识库", "当前没有可用的本地知识源。", "", "本地知识库")]
-        return await local_knowledge_search(str(args.get("query") or ""))
-    if name == "weather":
-        result = await get_weather(str(args.get("location") or args.get("query") or ""), timeout=timeout)
-        cache.set(name, args, result)
-        return result
-    if name == "weather_batch":
-        raw_locations = args.get("locations") or []
-        if not isinstance(raw_locations, list):
-            raw_locations = [raw_locations]
-        locations = list(dict.fromkeys(str(item).strip() for item in raw_locations if str(item).strip()))[:10]
-        if not locations:
-            return [SearchResult(title="批量天气失败", summary="没有提供有效城市。", url="", source="天气")]
-        batches = await asyncio.gather(
-            *[get_weather(location, timeout=timeout) for location in locations],
-            return_exceptions=True,
-        )
-        merged: list[SearchResult] = []
-        for location, batch in zip(locations, batches):
-            if isinstance(batch, Exception):
-                merged.append(SearchResult(title=f"{location}天气失败", summary=str(batch), url="", source="天气"))
-            else:
-                merged.extend(batch)
-        cache.set(name, args, merged)
-        return merged
-    if name == "news_search":
-        result = await search_news(str(args.get("query") or ""), timeout=timeout)
-        cache.set(name, args, result)
-        return result
-    if name == "multi_search":
-        queries = args.get("queries") or []
-        if not isinstance(queries, list):
-            queries = [queries]
-        result = await multi_search([str(item) for item in queries], timeout=timeout)
-        cache.set(name, args, result)
-        return result
-    if name == "github_repo_search":
-        result = await search_github_repositories(str(args.get("query") or ""), timeout=timeout)
-        cache.set(name, args, result)
-        return result
-    if name == "github_repo_inspect":
-        result = await inspect_github_repository(
-            str(args.get("repository") or ""),
-            str(args.get("query") or ""),
-            timeout=timeout,
-        )
-        cache.set(name, args, result)
-        return result
-    if name == "github_read_file":
-        return await read_github_file(
-            str(args.get("repository") or ""),
-            str(args.get("path") or ""),
-            timeout=timeout,
-        )
-    if name == "fetch_url":
-        return await fetch_web_page(str(args.get("url") or ""), timeout=timeout)
-    # web_search (default)
-    result = await search_web(str(args.get("query") or ""), timeout=timeout)
-    if _do_cache:
-        cache.set(name, args, result)
-    return result
+    tool_extensions: Mapping[str, Any] | None = None,
+) -> ToolResult:
+    budget_scope = current_budget_scope()
+    request_id = budget_scope.request_id if budget_scope is not None else f"agent-{call.id}"
+    context = ToolContext(
+        request_id=request_id,
+        group_id=budget_scope.group_id or "" if budget_scope is not None else "",
+        user_id=budget_scope.user_id or "" if budget_scope is not None else "",
+        deadline_monotonic=deadline,
+        cancel_scope=asyncio.current_task(),
+        policy_snapshot=policy_snapshot or PolicySnapshot(roles=frozenset({"group_member"})),
+        budget_scope=budget_scope,
+        budget_controller=getattr(llm, "budget_controller", None),
+        evidence_limit=8,
+        tool_timeout_seconds=tool_timeout,
+        result_max_chars=result_max_chars,
+        extensions={
+            "local_knowledge_search": local_knowledge_search,
+            **(dict(tool_extensions) if tool_extensions is not None else {}),
+        },
+    )
+    return await TOOL_REGISTRY.dispatch(call.name, call.arguments, context)
 
 
 def _tool_signature(tc: ToolCallRequest) -> tuple[str, str]:
@@ -543,23 +725,35 @@ def _tool_call_message(tc: ToolCallRequest) -> dict[str, Any]:
 
 def _format_tool_result(results: list[SearchResult], max_chars: int) -> str:
     """Format a list of SearchResult into a compact string for the tool message."""
-    if not results:
-        return "没有找到结果。"
-    lines = []
-    for idx, r in enumerate(results[:6], start=1):
-        summary = re.sub(r"\s+", " ", r.summary).strip()
-        if len(summary) > 2200:
-            summary = summary[:2200].rstrip() + "..."
-        url_part = f"\n   URL: {r.url}" if r.url else ""
-        lines.append(f"{idx}. {r.title}\n   {summary}{url_part}")
-    text = "\n".join(lines)
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "..."
-    return text
+    return format_search_results(results, max_chars)
+
+
+def _format_tool_observation(result: ToolResult, max_chars: int) -> str:
+    """Format status and content without discarding useful partial evidence."""
+    legacy_results = tool_result_to_search_results(result)
+    if isinstance(result.content, dict) and isinstance(result.content.get("text"), str):
+        detail = result.content["text"].strip()
+    elif legacy_results or result.status == ToolStatus.NO_RESULTS:
+        detail = _format_tool_result(legacy_results, max_chars=max_chars)
+    else:
+        detail = result.content if isinstance(result.content, str) else json.dumps(
+            result.content, ensure_ascii=False
+        )
+
+    if result.error is not None:
+        status = f"[{result.status.value}] {result.error.message}"
+        detail = f"{status}\n{detail}" if detail and detail != result.error.message else status
+    if len(detail) > max_chars:
+        return detail[:max_chars].rstrip() + "..."
+    return detail
 
 
 def _tool_progress(calls: list[ToolCallRequest]) -> tuple[str, str]:
     names = {call.name for call in calls}
+    if "sfm_generate_validate" in names:
+        return "sfm_generation", "正在检索指定版本的 SFM 示例并执行有界生成与验证。"
+    if names & {"repository_search", "repository_read"}:
+        return "repository", "正在只读检索已批准的本地 Git 仓库。"
     if "knowledge_search" in names:
         return "knowledge", "正在检索本地知识库和领域资料。"
     if names & {"github_repo_inspect", "github_read_file"}:
@@ -589,15 +783,22 @@ def _tool_progress(calls: list[ToolCallRequest]) -> tuple[str, str]:
 
 
 def _append_references(answer: str, references: list[tuple[int, str, str]], limit: int = 4) -> str:
-    unique: list[tuple[str, str]] = []
+    sfm_unique: list[tuple[str, str]] = []
+    regular_unique: list[tuple[str, str]] = []
     seen_urls: set[str] = set()
-    for _, title, url in sorted(references, key=lambda item: item[0]):
+    for priority, title, url in sorted(references, key=lambda item: item[0]):
         if not url or url in seen_urls:
             continue
         seen_urls.add(url)
-        unique.append((re.sub(r"\s+", " ", title).strip(), url))
-        if len(unique) >= limit:
-            break
+        item = (re.sub(r"\s+", " ", title).strip(), url)
+        if priority < 0:
+            sfm_unique.append(item)
+        elif len(regular_unique) < limit:
+            regular_unique.append(item)
+    # SFM source citations are part of the generated program's provenance.
+    # Keep all bounded (max 8) SFM references and use the normal cap for other
+    # sources only when room remains.
+    unique = sfm_unique + regular_unique[: max(0, limit - len(sfm_unique))]
     if not unique:
         return answer
     lines = [answer.rstrip(), "", "参考："]
@@ -808,72 +1009,3 @@ def _validate_research_answer(answer: str, messages: list[dict[str, Any]]) -> st
         "再打开 FTB 任务书的 ATM Star 章节，按前置任务准备各路线材料。ATM10 更新可能调整配方，游戏内 JEI/EMI 和任务书比旧攻略可靠。\n\n"
         "如果把 JEI 配方页截图或具体 ATM10 版本号发出来，我可以继续拆解每项材料的获取路线。"
     )
-
-
-# ── Legacy helpers kept for backward compatibility ────────────────────────────
-# (used by forced_tool path in bot_service.py and existing tests)
-
-@dataclass(frozen=True, slots=True)
-class ToolCall:
-    name: str
-    args: Mapping[str, str]
-
-
-@dataclass(frozen=True, slots=True)
-class ToolObservation:
-    call: ToolCall
-    results: tuple[SearchResult, ...]
-
-
-async def execute_tool_call(call: ToolCall, timeout: float) -> ToolObservation:
-    if call.name == "weather":
-        results = await get_weather(_tool_arg_value(call.name, call.args), timeout=timeout)
-    elif call.name == "news_search":
-        results = await search_news(_tool_arg_value(call.name, call.args), timeout=timeout)
-    elif call.name == "fetch_url":
-        results = await fetch_web_page(_tool_arg_value(call.name, call.args), timeout=timeout)
-    else:
-        results = await search_web(_tool_arg_value(call.name, call.args), timeout=timeout)
-    return ToolObservation(call=call, results=tuple(results))
-
-
-def forced_tool_call(action: str, payload: str) -> ToolCall | None:
-    payload = payload.strip()
-    if action == "weather":
-        return ToolCall("weather", {"location": payload})
-    if action == "news":
-        return ToolCall("news_search", {"query": payload})
-    if action == "web":
-        if payload.startswith(("http://", "https://")):
-            return ToolCall("fetch_url", {"url": payload})
-        return ToolCall("web_search", {"query": payload})
-    return None
-
-
-def format_tool_observations(observations: list[ToolObservation], max_chars: int) -> str:
-    if not observations:
-        return ""
-    lines = [
-        "Tool results. Use these as evidence. If results are failed, sparse, or irrelevant, say so.",
-    ]
-    for obs_idx, observation in enumerate(observations, start=1):
-        arg_text = ", ".join(f"{k}={v}" for k, v in observation.call.args.items())
-        lines.append(f"{obs_idx}. Tool {observation.call.name}({arg_text})")
-        for result_idx, result in enumerate(observation.results[:5], start=1):
-            summary = re.sub(r"\s+", " ", result.summary).strip()
-            if len(summary) > 420:
-                summary = summary[:420].rstrip() + "..."
-            url = f" URL: {result.url}" if result.url else ""
-            lines.append(f"   {result_idx}) [{result.source}] {result.title} - {summary}{url}")
-    text = "\n".join(lines)
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "..."
-    return text
-
-
-def _tool_arg_value(name: str, args: Mapping[str, str]) -> str:
-    if name == "weather":
-        return str(args.get("location") or args.get("query") or "").strip()
-    if name == "fetch_url":
-        return str(args.get("url") or "").strip()
-    return str(args.get("query") or args.get("keyword") or "").strip()

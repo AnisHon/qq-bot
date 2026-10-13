@@ -17,14 +17,28 @@ class EventDeduplicator:
     def accept(self, message_id: str) -> bool:
         if not message_id:
             return True
+        if self.contains(message_id):
+            return False
+        self.mark(message_id)
+        return True
+
+    def contains(self, message_id: str) -> bool:
+        if not message_id:
+            return False
         now = time.monotonic()
         expired = [key for key, timestamp in self._seen.items() if now - timestamp > self.ttl]
         for key in expired:
             self._seen.pop(key, None)
-        if message_id in self._seen:
-            return False
+        return message_id in self._seen
+
+    def mark(self, message_id: str) -> None:
+        if not message_id:
+            return
+        now = time.monotonic()
+        expired = [key for key, timestamp in self._seen.items() if now - timestamp > self.ttl]
+        for key in expired:
+            self._seen.pop(key, None)
         self._seen[message_id] = now
-        return True
 
 
 @dataclass(slots=True)

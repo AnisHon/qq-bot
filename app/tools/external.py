@@ -18,6 +18,13 @@ import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.models import SearchResult
+from app.tools.url_policy import (
+    FetchLimitError,
+    SafeHTTPFetcher,
+    URLPolicyError,
+    normalize_url,
+    redact_url,
+)
 
 
 # ── HTTP client helpers ───────────────────────────────────────────────────────
@@ -40,6 +47,7 @@ _BING_SEARCH_URL = "https://cn.bing.com/search"
 _GITHUB_API = "https://api.github.com"
 _GITHUB_HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": "qq-deepseek-bot/0.2"}
 _GITHUB_TREE_CACHE: dict[str, tuple[float, str, list[dict[str, Any]]]] = {}
+_SAFE_WEB_FETCHER = SafeHTTPFetcher(max_redirects=5, max_response_bytes=1_000_000)
 
 
 def _bing_client(timeout: float) -> httpx.AsyncClient:
@@ -84,8 +92,11 @@ def _github_headers() -> dict[str, str]:
 
 
 def looks_like_url(text: str) -> bool:
-    parsed = urlparse(text.strip())
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    try:
+        normalize_url(text)
+    except URLPolicyError:
+        return False
+    return True
 
 
 # ── Bing web search ───────────────────────────────────────────────────────────
@@ -658,75 +669,69 @@ async def _fetch_cnr_latest(timeout: float, max_results: int) -> list[SearchResu
 # ── Webpage fetch ─────────────────────────────────────────────────────────────
 
 async def fetch_web_page(url: str, timeout: float = 15.0) -> list[SearchResult]:
-    """Fetch and extract readable text from a webpage URL."""
-    url = url.strip()
-    if not looks_like_url(url):
-        return [_failed_result("网页读取", "这不是有效的 http/https URL。")]
+    """Fetch an HTTP(S) page only through the pinned, bounded public-web transport."""
+    safe_url = ""
     try:
-        async with _bing_client(timeout) as client:
-            request_headers = _github_headers() if urlparse(url).netloc.lower() == "api.github.com" else None
-            resp = await _get_with_retry(client, url, headers=request_headers)
-        if resp.status_code in {403, 429} and urlparse(url).netloc.lower() != "api.github.com":
-            return await _fetch_via_jina(url, timeout, f"目标网页返回 {resp.status_code}")
-        content_type = resp.headers.get("content-type", "")
-        resp.raise_for_status()
-    except httpx.TimeoutException:
-        return [_failed_result("网页读取", f"读取超时（>{timeout:.0f}s）。", url=url)]
+        safe_url = redact_url(normalize_url(url).url)
+        response = await _SAFE_WEB_FETCHER.get(url, timeout=timeout)
+    except (TimeoutError, httpx.TimeoutException):
+        return [_failed_result("网页读取", f"读取超时（>{timeout:.0f}s）。", url=safe_url)]
+    except URLPolicyError:
+        return [_failed_result("网页读取", "目标 URL 或其 DNS 解析结果不符合安全策略。", url=safe_url)]
+    except FetchLimitError:
+        return [_failed_result("网页读取", "响应超出安全大小限制或使用了不支持的压缩编码。", url=safe_url)]
     except Exception as exc:  # noqa: BLE001
-        return [_failed_result("网页读取", f"网页读取失败：{exc}", url=url)]
+        return [_failed_result("网页读取", f"网页读取失败（{type(exc).__name__}）。", url=safe_url)]
+
+    final_url = redact_url(response.url)
+    content_type = response.headers.get("content-type", "").casefold()
+    if response.status_code >= 400:
+        return [_failed_result("网页读取", f"目标网页返回 HTTP {response.status_code}。", url=final_url)]
+    text = response.text
 
     if "application/json" in content_type or "application/vnd.github+json" in content_type:
         try:
-            summary = json.dumps(resp.json(), ensure_ascii=False, indent=2)
+            summary = json.dumps(json.loads(text), ensure_ascii=False, indent=2)
         except ValueError:
-            summary = resp.text
+            summary = text
         if len(summary) > 6000:
             summary = summary[:6000].rstrip() + "..."
         return [
             SearchResult(
-                title=f"API数据：{urlparse(str(resp.url)).path}",
+                title=f"API数据：{urlparse(response.url).path}",
                 summary=summary,
-                url=str(resp.url),
-                source="GitHub API" if urlparse(url).netloc.lower() == "api.github.com" else "JSON API",
+                url=final_url,
+                source="GitHub API" if urlparse(response.url).hostname == "api.github.com" else "JSON API",
             )
         ]
 
     if "text/html" not in content_type and "text/plain" not in content_type:
-        return [_failed_result("网页读取", f"内容类型 {content_type or '未知'} 不支持读取。", url=url)]
+        return [_failed_result("网页读取", f"内容类型 {content_type or '未知'} 不支持读取。", url=final_url)]
 
-    page_title = _extract_title(resp.text) or url
-    summary = _extract_page_text(resp.text)
-    if len(summary) < 80 and urlparse(url).netloc.lower() != "api.github.com":
-        return await _fetch_via_jina(url, timeout, "网页正文无法直接提取")
+    page_title = _extract_title(text) or final_url
+    summary = _extract_page_text(text)
     if len(summary) > 1200:
         summary = summary[:1200].rstrip() + "..."
     return [
         SearchResult(
             title=page_title,
             summary=summary or "网页内容为空或无法提取。",
-            url=str(resp.url),
+            url=final_url,
             source="网页读取",
         )
     ]
 
 
 async def _fetch_via_jina(url: str, timeout: float, reason: str) -> list[SearchResult]:
-    """Use Jina Reader as a bounded fallback for public HTML pages."""
-    reader_url = f"https://r.jina.ai/{url}"
-    try:
-        async with _bing_client(timeout) as client:
-            resp = await _get_with_retry(client, reader_url, headers={"Accept": "text/plain"})
-        resp.raise_for_status()
-        body = resp.text.strip()
-    except Exception as exc:  # noqa: BLE001
-        return [_failed_result("网页读取", f"{reason}；备用读取也失败：{exc}", url=url)]
-    if not body:
-        return [_failed_result("网页读取", f"{reason}；备用读取返回空内容。", url=url)]
-    title_match = re.search(r"^Title:\s*(.+)$", body, re.MULTILINE)
-    title = title_match.group(1).strip() if title_match else url
-    if len(body) > 6000:
-        body = body[:6000].rstrip() + "..."
-    return [SearchResult(title=title, summary=body, url=url, source="Jina Reader")]
+    """Retained as a compatibility shim; unvalidated URLs are never sent to a Reader."""
+    del timeout
+    return [
+        _failed_result(
+            "网页读取",
+            f"{reason}；远程 Reader fallback 已禁用，未转交目标 URL。",
+            url=redact_url(url),
+        )
+    ]
 
 
 # ── Weather ───────────────────────────────────────────────────────────────────

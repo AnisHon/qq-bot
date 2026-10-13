@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import re
 import time
 from dataclasses import dataclass, field
@@ -28,10 +29,10 @@ def _coerce_text(value: Any) -> str:
 class NatcapQQAdapter:
     _client: httpx.AsyncClient = field(init=False, repr=False)
     _bot_name_cache: dict[str, tuple[tuple[str, ...], float]] = field(default_factory=dict, init=False, repr=False)
-    api_base_url: str
-    api_token: str = ""
+    api_base_url: str = field(repr=False)
+    api_token: str = field(default="", repr=False)
     bot_qq_id: str = ""
-    callback_token: str = ""
+    callback_token: str = field(default="", repr=False)
     timeout: float = 30.0
 
     def __post_init__(self) -> None:
@@ -51,13 +52,33 @@ class NatcapQQAdapter:
             return {}
         return {"Authorization": f"Bearer {token}"}
 
+    @property
+    def callback_auth_configured(self) -> bool:
+        return bool(self.callback_token.strip())
+
     def verify_callback_token(self, headers: Mapping[str, str]) -> bool:
-        if not self.callback_token:
-            return True
-        auth = headers.get("authorization") or headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            return auth.removeprefix("Bearer ").strip() == self.callback_token
-        return auth.strip() == self.callback_token
+        expected = self.callback_token.strip()
+        if not expected:
+            return False
+
+        auth_value = next(
+            (
+                value
+                for name, value in headers.items()
+                if str(name).casefold() == "authorization"
+            ),
+            "",
+        )
+        if not isinstance(auth_value, str):
+            return False
+
+        auth = auth_value.strip()
+        scheme, separator, credential = auth.partition(" ")
+        presented = credential.strip() if separator and scheme.casefold() == "bearer" else auth
+        return hmac.compare_digest(
+            presented.encode("utf-8"),
+            expected.encode("utf-8"),
+        )
 
     def parse_group_event(self, payload: Mapping[str, Any]) -> GroupMessageEvent | None:
         if payload.get("post_type") != "message":
