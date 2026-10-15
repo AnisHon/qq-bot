@@ -287,7 +287,8 @@ def create_app() -> FastAPI:
 
     @app.post("/onebot/event")
     async def onebot_event(request: Request) -> JSONResponse:
-        if not adapter.verify_callback_token(request.headers):
+        body = await request.body()
+        if not adapter.verify_callback_token(request.headers, body):
             raise HTTPException(status_code=401, detail="unauthorized")
         payload = await request.json()
         if not isinstance(payload, dict):

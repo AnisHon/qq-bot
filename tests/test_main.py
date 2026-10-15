@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import tempfile
@@ -113,6 +115,39 @@ class OneBotAdmissionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ready.status_code, 503)
             self.assertEqual(ready.json()["reason"], "onebot_callback_auth_not_configured")
             self.assertEqual(callback.status_code, 401)
+
+    async def test_napcat_http_signature_authenticates_exact_request_body(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qq-bot-napcat-signature-test-") as temp_dir:
+            token = "fixture-callback-token"
+            with patch.dict(
+                os.environ,
+                {
+                    "SQLITE_PATH": str(Path(temp_dir) / "bot.db"),
+                    "RAG_ENABLED": "false",
+                    "NATCAPQQ_CALLBACK_TOKEN": token,
+                },
+            ):
+                _root_logger.addHandler(_null_handler)
+                try:
+                    app = create_app()
+                finally:
+                    _root_logger.removeHandler(_null_handler)
+            body = json.dumps({"post_type": "notice"}, separators=(",", ":")).encode()
+            signature = "sha1=" + hashlib.sha1(token.encode() + body).hexdigest()
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    accepted = await client.post(
+                        "/onebot/event", content=body, headers={"X-Signature": signature}
+                    )
+                    tampered = await client.post(
+                        "/onebot/event",
+                        content=body + b" ",
+                        headers={"X-Signature": signature},
+                    )
+            self.assertEqual((accepted.status_code, accepted.json()["status"]), (200, "ignored"))
+            self.assertEqual(tampered.status_code, 401)
 
     async def test_full_queue_returns_503_and_does_not_poison_deduplication(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qq-bot-main-test-") as temp_dir:

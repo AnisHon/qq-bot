@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import unittest
 from unittest.mock import patch
@@ -61,6 +62,16 @@ class NatcapQQAdapterTest(unittest.TestCase):
         self.assertTrue(adapter.verify_callback_token({"Authorization": "Bearer expected"}))
         self.assertTrue(adapter.verify_callback_token({"AUTHORIZATION": "bEaReR expected"}))
         self.assertTrue(adapter.verify_callback_token({"authorization": "expected"}))
+
+    def test_callback_token_accepts_napcat_http_client_signature(self) -> None:
+        token = "expected"
+        body = b'{"post_type":"notice"}'
+        signature = "sha1=" + hashlib.sha1(token.encode() + body).hexdigest()
+        adapter = NatcapQQAdapter("http://127.0.0.1:3000", callback_token=token)
+
+        self.assertTrue(adapter.verify_callback_token({"x-signature": signature}, body))
+        self.assertFalse(adapter.verify_callback_token({"x-signature": signature}, body + b" "))
+        self.assertFalse(adapter.verify_callback_token({"x-signature": "sha1=wrong"}, body))
 
     def test_adapter_repr_omits_api_credentials_and_callback_token(self) -> None:
         adapter = NatcapQQAdapter(

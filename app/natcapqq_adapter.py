@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import re
 import time
@@ -56,10 +57,26 @@ class NatcapQQAdapter:
     def callback_auth_configured(self) -> bool:
         return bool(self.callback_token.strip())
 
-    def verify_callback_token(self, headers: Mapping[str, str]) -> bool:
+    def verify_callback_token(self, headers: Mapping[str, str], body: bytes | None = None) -> bool:
         expected = self.callback_token.strip()
         if not expected:
             return False
+
+        signature = next(
+            (
+                value
+                for name, value in headers.items()
+                if str(name).casefold() == "x-signature"
+            ),
+            "",
+        )
+        if signature:
+            if body is None or not isinstance(signature, str):
+                return False
+            # NapCat HTTP Client signs the exact request bytes as sha1(token + body).
+            # Keep the legacy Bearer/raw-token path for existing OneBot clients.
+            expected_signature = "sha1=" + hashlib.sha1(expected.encode("utf-8") + body).hexdigest()
+            return hmac.compare_digest(signature.strip(), expected_signature)
 
         auth_value = next(
             (
