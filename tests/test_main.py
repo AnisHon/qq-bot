@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -133,7 +134,7 @@ class OneBotAdmissionTest(unittest.IsolatedAsyncioTestCase):
                 finally:
                     _root_logger.removeHandler(_null_handler)
             body = json.dumps({"post_type": "notice"}, separators=(",", ":")).encode()
-            signature = "sha1=" + hashlib.sha1(token.encode() + body).hexdigest()
+            signature = "sha1=" + hmac.new(token.encode(), body, hashlib.sha1).hexdigest()
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(
                     transport=httpx.ASGITransport(app=app), base_url="http://test"

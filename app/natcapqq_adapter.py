@@ -73,9 +73,10 @@ class NatcapQQAdapter:
         if signature:
             if body is None or not isinstance(signature, str):
                 return False
-            # NapCat HTTP Client signs the exact request bytes as sha1(token + body).
+            # NapCat HTTP Client uses crypto.createHmac("sha1", token).update(body).
             # Keep the legacy Bearer/raw-token path for existing OneBot clients.
-            expected_signature = "sha1=" + hashlib.sha1(expected.encode("utf-8") + body).hexdigest()
+            digest = hmac.new(expected.encode("utf-8"), body, hashlib.sha1).hexdigest()
+            expected_signature = "sha1=" + digest
             return hmac.compare_digest(signature.strip(), expected_signature)
 
         auth_value = next(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import unittest
 from unittest.mock import patch
@@ -66,7 +67,7 @@ class NatcapQQAdapterTest(unittest.TestCase):
     def test_callback_token_accepts_napcat_http_client_signature(self) -> None:
         token = "expected"
         body = b'{"post_type":"notice"}'
-        signature = "sha1=" + hashlib.sha1(token.encode() + body).hexdigest()
+        signature = "sha1=" + hmac.new(token.encode(), body, hashlib.sha1).hexdigest()
         adapter = NatcapQQAdapter("http://127.0.0.1:3000", callback_token=token)
 
         self.assertTrue(adapter.verify_callback_token({"x-signature": signature}, body))
