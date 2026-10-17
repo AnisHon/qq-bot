@@ -1,5 +1,13 @@
 # Context Management V2 实施进度
 
+## 部署补记（2026-10-17）
+
+- 按用户后续授权，已将 Context V2 部署至 `tx:/home/anishan/project/bot`。GitHub `main` 与远端 checkout 当前提交为 `a2a57d3`。
+- 分组提交：`5415981`（Context/历史存储）、`7a5b5ae`（Agent/Evidence）、`7a3cca9`（命令/服务接线）、`a2a57d3`（文档/评估）。
+- `qq-deepseek-bot.service` 已重启并 active；`/ready`、`/health` 均返回 200。生产 SQLite 增量 schema 已初始化；只读 `PRAGMA integrity_check` 为 `ok`，消息历史与 FTS 行数均为 70。未执行 purge 或 TTL 清理。
+- 部署前没有创建额外生产数据库备份；本次只执行已测试的非破坏性增量 schema 初始化，没有清理或删除历史。后续 purge/TTL 等破坏性维护仍需单独授权和备份演练。
+- 本机通过生产服务做了无副作用的 OneBot `meta_event` 签名探测：有效 HMAC 返回 200/ignored，错误签名返回 401；NapCat Docker 容器自部署后日志中 401 数为 0。没有真实 QQ 群消息，因此真实 NapCat 消息回调及 bot 回复仍未端到端验证。
+
 ## 最终验收补记（2026-10-15）
 
 - CV2-01..12 均已完成本地实现与适用验收。最终命令 `timeout 300 .venv/bin/python -m unittest discover -s tests -q`：406 tests，OK（11.097 秒）；未调用真实模型、QQ 或生产数据库。
@@ -8,14 +16,14 @@
 - 新增 Evidence Reader 经现有 ToolRegistry 约束，只能分页读取当前请求已缓存 Evidence；之前 Registry 裁剪的内容仍为 partial，不能伪称完整。定向 Registry/Agent 回归 29 与 24 tests 均通过。
 - 全量测试有旧 Recipe repository/importer fixture 的未关闭 SQLite 连接 ResourceWarning、FastAPI `on_event` 弃用告警及预期错误路径日志；测试无失败。上下文历史与记忆定向测试在 ResourceWarning 检查下通过且无本模块泄漏警告。
 
-开始基线：`63a9da1`（2026-10-15）。部署/生产数据库/真实模型/真实 QQ 测试均未授权，本轮不执行。生产 GTNH 数据与真实 SFM Parser 当前未知/不可用。
+开始基线：`63a9da1`（2026-10-15）。Context V2 实施验收时未部署；后续部署见上方补记。真实模型、GTNH 数据、真实 SFM Parser 和真实 QQ 群消息回归仍未验证。
 
 ## 总览
 
 - 任务总数：12
 - 状态：CV2-01..12 `COMPLETED`；没有阻塞本地实施的外部依赖。
-- 当前执行位置：全部本地可执行任务完成；真实模型、GTNH 数据、SFM Parser 与生产环境仍未验证。
-- 回滚/检查点：不创建git commit，初始工作树有未跟踪审计与V2文档（本会话前已存在）；通过任务级进度和文件修改说明恢复。
+- 当前执行位置：12项本地任务与服务器部署检查完成；真实模型、GTNH 数据、SFM Parser 和真实 QQ 消息回归未验证。
+- 回滚/检查点：四个分组提交见部署补记。原有未跟踪的 `docs/CONTEXT_MANAGEMENT_AUDIT.md` 未纳入提交并予以保留。
 - 测试：`timeout 300 .venv/bin/python -m unittest discover -s tests -q`：406 tests，OK；未调用真实模型或 QQ。
 
 ## 任务记录

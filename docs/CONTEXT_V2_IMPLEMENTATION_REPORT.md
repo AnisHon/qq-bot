@@ -2,13 +2,13 @@
 
 日期：2026-10-15
 实现基线：`63a9da1`；实现时以工作区当前源码为准。
-生产部署、生产数据库迁移、真实 QQ 消息、真实模型调用和 Git 提交均未执行。
+原始实现验收完成时未执行生产部署或 Git 提交；2026-10-17 按用户后续授权完成分组提交和部署。真实 QQ 群消息与真实模型调用仍未执行。
 
 ## 1. 实施摘要
 
 CV2-01 至 CV2-12 的本地实现和可执行验收已完成。改动保留现有 FastAPI、OneBot 接入、自研 Agent Loop、OpenAI 兼容客户端、SQLite、FTS5、Chroma 和 Command Registry。新增 ContextManager、Context Window Budget、历史检索、结构化事实与事件记忆、Agent 压缩/Evidence、任务 Working Memory，以及上下文命令和离线评估。
 
-完整 unittest discovery 共 406 项，通过 406 项。测试使用 Fake、Fixture、临时 SQLite、Fake Embedding 和本地临时 Chroma；没有调用真实模型、向真实群发消息或使用生产数据库。GTNH 文档/配方真实数据、真实模型长对话质量、SFM Parser 和生产行为都仍为 `NOT_VERIFIED`。
+完整 unittest discovery 共 406 项，通过 406 项。测试使用 Fake、Fixture、临时 SQLite、Fake Embedding 和本地临时 Chroma；没有调用真实模型、向真实群发消息或使用生产数据库。服务器部署后的健康、就绪、签名入口和 SQLite 完整性已做 smoke check；真实 QQ 群消息回复、GTNH 文档/配方数据、真实模型长对话质量和 SFM Parser 仍为 `NOT_VERIFIED`。
 
 实现并未获得精确 Tokenizer 计量能力。Context Window Budget 使用明确标注的 UTF-8 JSON 字节启发式估算；默认模式为 `off`。只有维护者按精确 `provider:model` 配置 Profile 并主动启用 `enforce` 后才会在 API 派发前执行窗口限制。Fixture 测试显示历史召回改善，但 V2 prompt 估算大小明显增加，不能据此声称真实模型任务质量提高。
 
@@ -89,7 +89,7 @@ WorkingState 记录请求目标、约束、已完成/待完成步骤、观察到
 - `episodic_memory`、`episode_fts`。
 - `history_purge_jobs`、`history_vector_outbox`、`agent_tasks`、`agent_checkpoints`、`context_compaction_metrics`。
 
-既有 memory ID/内容与历史原文不主动删除。初始化可触发有限批次索引回填，并将运行中的旧任务状态改为 interrupted。自动历史 TTL 清理默认关闭；本次未修改任何现有或生产数据库。
+既有 memory ID/内容与历史原文不主动删除。初始化可触发有限批次索引回填，并将运行中的旧任务状态改为 interrupted。自动历史 TTL 清理默认关闭；本地实现和测试没有改生产库，部署后的实际迁移情况见第 9 节。
 
 生产启用前的操作要求：在副本上先演练旧 schema 升级、校验 row counts 与 FTS 覆盖、验证备份恢复，然后在维护窗口升级。明确历史留存策略前保持自动 prune 关闭。回滚代码时保留已新增的 SQLite 列与表，不执行反向 DROP；将 Context Budget 留在 `off`、停用可选向量索引即可退回低风险运行。若生产数据迁移后发现 schema 问题，先恢复已验证备份，不要在生产直接执行破坏性清理。
 
@@ -138,14 +138,14 @@ OK
 - **真实 GTNH 数据验证：NOT_VERIFIED**，目前没有数据集。
 - **真实 SFM Parser 验证：NOT_VERIFIED**，当前未验证可独立运行的 Parser。
 - **真实模型质量与 tokenizer 校准：NOT_VERIFIED**，没有付费 API 或真实模型基准。
-- **生产环境：未执行**，没有部署、Bot 重启或生产迁移。
+- **生产服务：已部署并通过健康检查**；生产 schema 初始化已执行，检查细节见第 9 节。没有真实 QQ 消息回归。
 
 ## 6. 尚未交付及生产准备
 
 上线前需要维护者处理：
 
-1. 为所有活动模型精确填写 Context Window Profile，核对窗口及最大输出。新部署先以 `shadow` 观察估算误差；正式启用 `enforce` 前确认所有活动模型均有 Profile。`operator_declared` 表示运维声明未验证，不能当作模型厂商规格确认。
-2. 备份生产 SQLite 并在副本演练增量迁移、旧 ID/行数、FTS 回填和恢复。生产 schema 当前没有迁移。
+1. 为所有活动模型精确填写 Context Window Profile，核对窗口及最大输出。当前 Context Budget 为 `off`；正式启用 `enforce` 前确认所有活动模型均有 Profile。`operator_declared` 表示运维声明未验证，不能当作模型厂商规格确认。
+2. 本次部署前没有创建额外生产数据库备份；启动时已执行非破坏性增量 schema 初始化，`integrity_check` 返回 `ok`。未来任何会清理/删除生产历史或改变保留策略的操作之前，先制作备份并在副本演练迁移、旧 ID/行数、FTS 回填和恢复。
 3. 决定历史原文保留时间与 purge 值班流程；自动 TTL 删除默认关闭，不要在没有留存决策时打开。
 4. 若需要语义历史检索，先选定可用的本地 Embedding 及版本并显式接入；当前应用默认仅使用 FTS，语义 adapter 的 fake 合约不等于生产向量能力。
 5. 获取并验证 GTNH Wiki/任务书/配方数据和字段来源，再进行真实数据完整性验收；GTNH 真实能力未交付。
@@ -169,6 +169,16 @@ OK
 
 ## 8. 回滚和检查点
 
-本次没有建立 Git commit，未提交或 push。`git diff --check` 已通过。通过 `docs/CONTEXT_V2_PROGRESS.md`、未提交文件差异和本报告恢复进度；原有未跟踪的审计/V2 规划文档已保留。
+代码通过四个分组 commit 推送：`5415981`、`7a5b5ae`、`7a3cca9`、`a2a57d3`。未提交原有未跟踪的 `docs/CONTEXT_MANAGEMENT_AUDIT.md`，避免将此前已有文件夹带进本次提交。
 
-代码回滚应逐项恢复本次已修改源码和测试；不要删除用户原有未跟踪文档。若之后已经在真实数据库启用增量 schema，回滚应用代码后保留 schema，不执行 DROP 或数据重建。生产迁移、enforce 切换和历史清理均未执行。
+代码回滚应逐项 revert 本次提交；不要删除用户原有未跟踪文档。生产已完成增量 schema 初始化，回滚应用代码时保留新增 schema，不执行 DROP 或数据重建。生产 enforce 切换与历史清理均未执行。
+
+## 9. 部署补记（2026-10-17）
+
+- GitHub `main` 和服务器 `/home/anishan/project/bot` 均部署至 `a2a57d3`。服务器通过 `tx` SSH 的 Git bundle fast-forward 更新；因服务器到 GitHub 的 HTTPS 拉取两次中断，未改服务器 Git URL 或凭据。
+- `qq-deepseek-bot.service` 重启后为 `active`；`/ready` HTTP 200、`/health` HTTP 200。部署前后服务工作区 clean。
+- Context V2 SQLite schema 在启动时初始化。使用只读连接运行 `PRAGMA integrity_check` 返回 `ok`；`message_history` 与 `chat_history_fts` 各 70 行，`memories` 9 行，`episodic_memory` 和 Agent task/checkpoint 表正常存在。没有检查或输出消息正文。
+- 自动历史清理配置未启用；本次没有执行 reset、purge、TTL 删除或真实历史内容变更。Context Window Budget 仍使用默认 `off`，未切换生产 enforce。
+- 本次部署前没有创建额外生产 SQLite 备份；未改变现有聊天内容。执行生产 purge、TTL 清理或其它破坏性历史维护前，需先明确授权并备份演练。
+- 使用生产进程内配置的回调密钥构造了本机无副作用 heartbeat `meta_event`：正确 `X-Signature` 得到 `200 {"status":"ignored"}`，错误签名得到 401。密钥值没有输出。NapCat Docker 部署后日志匹配到的 `Unexpected status code: 401` 数量为 0；期间没有真实 QQ 消息，故不能据此证明 NapCat 对真实群消息完成端到端投递与回复。
+- 服务器 GitHub HTTPS 拉取超时后，使用本地已验证的 145 KiB Git bundle 经 SSH 传输，服务器只做 fast-forward；临时 bundle 已在部署检查后清理。
