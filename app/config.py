@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import json
 import os
 import re
+
+from app.context.budget import ContextWindowProfile
 
 
 def _as_bool(value: str | None, default: bool = False) -> bool:
@@ -79,6 +82,40 @@ def _parse_local_git_repositories(value: str | None) -> tuple[tuple[str, Path], 
     return tuple(sorted(parsed.items()))
 
 
+def _parse_context_window_profiles(value: str | None) -> tuple[ContextWindowProfile, ...]:
+    if not value or not value.strip():
+        return ()
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("LLM_CONTEXT_WINDOW_PROFILES must be valid JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("LLM_CONTEXT_WINDOW_PROFILES must be a JSON object")
+    profiles = []
+    for key, raw_profile in data.items():
+        if not isinstance(key, str) or ":" not in key or not isinstance(raw_profile, dict):
+            raise ValueError("context profiles must use provider:model keys and object values")
+        provider, model = key.split(":", 1)
+        window = raw_profile.get("context_window_tokens")
+        status = raw_profile.get("status", "operator_declared")
+        max_output = raw_profile.get("max_output_tokens")
+        preferred_output = raw_profile.get("preferred_output_tokens")
+        if isinstance(window, bool) or not isinstance(window, int):
+            raise ValueError("context profile context_window_tokens must be an integer")
+        if not isinstance(status, str):
+            raise ValueError("context profile status must be a string")
+        for name, output_limit in (
+            ("max_output_tokens", max_output),
+            ("preferred_output_tokens", preferred_output),
+        ):
+            if output_limit is not None and (isinstance(output_limit, bool) or not isinstance(output_limit, int)):
+                raise ValueError(f"context profile {name} must be an integer")
+        profiles.append(
+            ContextWindowProfile(provider, model, window, status, max_output, preferred_output)
+        )
+    return tuple(profiles)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     app_host: str = "0.0.0.0"
@@ -119,8 +156,22 @@ class Settings:
 
     sqlite_path: Path = Path("data/bot.db")
     message_history_limit: int = 80
-    context_recent_message_limit: int = 8
+    context_history_max_messages_per_group: int = 20_000
+    context_history_max_bytes_per_group: int = 512 * 1024 * 1024
+    context_history_retention_days: int = 30
+    context_history_auto_prune: bool = False
+    context_recent_message_limit: int = 24
+    context_recent_candidate_limit: int = 120
+    context_history_fts_limit: int = 24
+    context_history_final_limit: int = 12
+    context_history_neighbor_limit: int = 32
+    context_history_max_reply_depth: int = 3
+    context_history_retrieval_enabled: bool = True
+    context_max_user_input_bytes: int = 65_536
     summary_trigger_message_count: int = 18
+    summary_trigger_token_count: int = 3000
+    summary_max_input_bytes: int = 262_144
+    summary_max_batch_rows: int = 100
     summary_max_chars: int = 1200
     memory_query_limit: int = 10
     rag_enabled: bool = True
@@ -142,6 +193,9 @@ class Settings:
     llm_budget_user_tokens_per_day: int | None = None
     llm_budget_default_max_completion_tokens: int | None = None
     llm_budget_reservation_lease_seconds: int = 300
+    llm_context_budget_mode: str = "off"
+    llm_context_window_profiles: tuple[ContextWindowProfile, ...] = ()
+    llm_context_default_output_tokens: int = 2048
     reply_notice_delay: float = 3.0
     network_tool_timeout: float = 10.0
     network_proxy_url: str = field(default="", repr=False)
@@ -176,6 +230,9 @@ class Settings:
         reservation_lease_minimum = int(
             max(agent_timeout, *provider_timeouts) + shutdown_drain_timeout + 30
         )
+        context_budget_mode = os.getenv("LLM_CONTEXT_BUDGET_MODE", "off").strip().casefold()
+        if context_budget_mode not in {"off", "shadow", "enforce"}:
+            raise ValueError("LLM_CONTEXT_BUDGET_MODE must be off, shadow, or enforce")
         return cls(
             app_host=os.getenv("APP_HOST", "0.0.0.0"),
             app_port=_as_int(os.getenv("APP_PORT"), 8080),
@@ -219,8 +276,51 @@ class Settings:
             bot_name_cache_seconds=max(60, _as_int(os.getenv("BOT_NAME_CACHE_SECONDS"), 3600)),
             sqlite_path=Path(os.getenv("SQLITE_PATH", "data/bot.db")),
             message_history_limit=max(20, _as_int(os.getenv("MESSAGE_HISTORY_LIMIT"), 80)),
-            context_recent_message_limit=max(2, _as_int(os.getenv("CONTEXT_RECENT_MESSAGE_LIMIT"), 8)),
+            context_history_max_messages_per_group=_bounded_int(
+                os.getenv("CONTEXT_HISTORY_MAX_MESSAGES_PER_GROUP"), 20_000, 1, 10_000_000
+            ),
+            context_history_max_bytes_per_group=_bounded_int(
+                os.getenv("CONTEXT_HISTORY_MAX_BYTES_PER_GROUP"), 512 * 1024 * 1024, 65_536,
+                16 * 1024 * 1024 * 1024,
+            ),
+            context_history_retention_days=_bounded_int(
+                os.getenv("CONTEXT_HISTORY_RETENTION_DAYS"), 30, 1, 3650
+            ),
+            context_history_auto_prune=_as_bool(os.getenv("CONTEXT_HISTORY_AUTO_PRUNE"), False),
+            context_recent_message_limit=_bounded_int(
+                os.getenv("CONTEXT_RECENT_MESSAGE_LIMIT"), 24, 2, 120
+            ),
+            context_recent_candidate_limit=_bounded_int(
+                os.getenv("CONTEXT_RECENT_CANDIDATE_LIMIT"), 120, 24, 500
+            ),
+            context_history_fts_limit=_bounded_int(
+                os.getenv("CONTEXT_HISTORY_FTS_LIMIT"), 24, 1, 100
+            ),
+            context_history_final_limit=_bounded_int(
+                os.getenv("CONTEXT_HISTORY_FINAL_LIMIT"), 12, 1, 48
+            ),
+            context_history_neighbor_limit=_bounded_int(
+                os.getenv("CONTEXT_HISTORY_NEIGHBOR_LIMIT"), 32, 1, 100
+            ),
+            context_history_max_reply_depth=_bounded_int(
+                os.getenv("CONTEXT_HISTORY_MAX_REPLY_DEPTH"), 3, 0, 3
+            ),
+            context_history_retrieval_enabled=_as_bool(
+                os.getenv("CONTEXT_HISTORY_RETRIEVAL_ENABLED"), True
+            ),
+            context_max_user_input_bytes=_bounded_int(
+                os.getenv("CONTEXT_MAX_USER_INPUT_BYTES"), 65_536, 1_024, 1_048_576
+            ),
             summary_trigger_message_count=max(6, _as_int(os.getenv("SUMMARY_TRIGGER_MESSAGE_COUNT"), 18)),
+            summary_trigger_token_count=_bounded_int(
+                os.getenv("SUMMARY_TRIGGER_TOKEN_COUNT"), 3000, 256, 100_000
+            ),
+            summary_max_input_bytes=_bounded_int(
+                os.getenv("SUMMARY_MAX_INPUT_BYTES"), 262_144, 4096, 2_000_000
+            ),
+            summary_max_batch_rows=_bounded_int(
+                os.getenv("SUMMARY_MAX_BATCH_ROWS"), 100, 1, 500
+            ),
             summary_max_chars=max(300, _as_int(os.getenv("SUMMARY_MAX_CHARS"), 1200)),
             memory_query_limit=max(1, _as_int(os.getenv("MEMORY_QUERY_LIMIT"), 10)),
             rag_enabled=_as_bool(os.getenv("RAG_ENABLED"), True),
@@ -254,6 +354,13 @@ class Settings:
             ),
             llm_budget_default_max_completion_tokens=_optional_positive_int(
                 os.getenv("LLM_BUDGET_DEFAULT_MAX_COMPLETION_TOKENS")
+            ),
+            llm_context_budget_mode=context_budget_mode,
+            llm_context_window_profiles=_parse_context_window_profiles(
+                os.getenv("LLM_CONTEXT_WINDOW_PROFILES")
+            ),
+            llm_context_default_output_tokens=_bounded_int(
+                os.getenv("LLM_CONTEXT_DEFAULT_OUTPUT_TOKENS"), 2048, 128, 65536
             ),
             llm_budget_reservation_lease_seconds=max(
                 300,

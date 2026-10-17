@@ -30,6 +30,47 @@ def select_recent_context(
     return [row for row in rows if id(row) in selected_ids][-limit:]
 
 
+def select_recent_context_v2(
+    rows: Sequence[dict[str, str]],
+    current_user_id: str,
+    limit: int,
+    *,
+    reply_chain_row_ids: set[int] | None = None,
+    ambient_limit: int = 2,
+) -> list[dict[str, str]]:
+    """Choose a bounded request snapshot without treating unrelated bot replies as direct."""
+    if limit <= 0:
+        return []
+    chain_ids = reply_chain_row_ids or set()
+    current_requests = {
+        str(row.get("request_id"))
+        for row in rows
+        if row.get("role") == "user"
+        and str(row.get("user_id")) == str(current_user_id)
+        and row.get("request_id")
+    }
+    chain: list[dict[str, str]] = []
+    direct: list[dict[str, str]] = []
+    related_assistant: list[dict[str, str]] = []
+    ambient: list[dict[str, str]] = []
+    for row in reversed(rows):
+        row_id = int(row.get("id") or 0)
+        if row_id in chain_ids:
+            chain.append(row)
+        elif row.get("role") == "user" and str(row.get("user_id")) == str(current_user_id):
+            direct.append(row)
+        elif row.get("role") == "assistant" and str(row.get("request_id") or "") in current_requests:
+            related_assistant.append(row)
+        elif len(ambient) < ambient_limit:
+            ambient.append(row)
+        if len(chain) + len(direct) + len(related_assistant) + len(ambient) >= limit:
+            break
+    selected_ids = {
+        id(row) for row in [*chain, *direct, *related_assistant, *ambient]
+    }
+    return [row for row in rows if id(row) in selected_ids]
+
+
 def format_recent_messages(rows: Sequence[dict[str, str]]) -> list[dict[str, str]]:
     """Format recent history rows as multi-turn user and assistant messages."""
     result: list[dict[str, str]] = []

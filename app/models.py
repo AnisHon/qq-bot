@@ -56,3 +56,5 @@ class SearchResult:
 class ChatReply:
     text: str
     should_send: bool = True
+    context_epoch: int | None = None
+    context_persisted: bool | None = None
