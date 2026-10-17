@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from copy import deepcopy
 import json
 import logging
@@ -308,4 +309,14 @@ class ToolRegistry:
             status = ToolStatus.PARTIAL
         else:
             status = result.status
-        return ToolResult(status=status, content=content, evidence=evidence, usage=result.usage, error=result.error)
+        completeness = result.completeness
+        if result.status == ToolStatus.PARTIAL or content_truncated or len(evidence) != len(result.evidence):
+            completeness = "partial"
+            evidence = tuple(
+                replace(item, completeness="partial") if item.completeness == "complete" else item
+                for item in evidence
+            )
+        return ToolResult(
+            status=status, content=content, evidence=evidence, usage=result.usage,
+            error=result.error, completeness=completeness,
+        )

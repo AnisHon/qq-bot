@@ -17,9 +17,34 @@ from app.usage_budget import (
     ProviderUsage,
     current_budget_scope,
 )
+from app.context.budget import ContextBudgetDecision, ContextWindowBudget
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class ProviderContextLengthError(RuntimeError):
+    """A provider explicitly reported that an otherwise valid request exceeded its window."""
+
+
+def _is_provider_context_length_error(response: httpx.Response) -> bool:
+    if response.status_code not in {400, 413}:
+        return False
+    try:
+        snippet = response.content[:8192].decode("utf-8", errors="ignore").casefold()
+    except (httpx.ResponseNotRead, RuntimeError):
+        return False
+    return any(
+        marker in snippet
+        for marker in (
+            "context_length_exceeded",
+            "maximum context length",
+            "context length is exceeded",
+            "context window exceeded",
+            "prompt is too long",
+            "too many tokens",
+        )
+    )
 
 
 @asynccontextmanager
@@ -30,8 +55,35 @@ async def _empty_async_context():
 def _raise_for_status(response: httpx.Response) -> None:
     if response.is_success:
         return
+    if _is_provider_context_length_error(response):
+        raise ProviderContextLengthError("provider rejected request for context length")
     # Do not echo the provider URL or response body: either can contain
     # credentials. This also avoids reading an unbounded streaming error body.
+    raise RuntimeError(f"LLM request failed with HTTP {response.status_code}")
+
+
+async def _raise_for_stream_status(response: httpx.Response) -> None:
+    if response.is_success:
+        return
+    if response.status_code in {400, 413}:
+        snippet = bytearray()
+        async for chunk in response.aiter_bytes():
+            snippet.extend(chunk[: 8192 - len(snippet)])
+            if len(snippet) >= 8192:
+                break
+        lowered = bytes(snippet).decode("utf-8", errors="ignore").casefold()
+        if any(
+            marker in lowered
+            for marker in (
+                "context_length_exceeded",
+                "maximum context length",
+                "context length is exceeded",
+                "context window exceeded",
+                "prompt is too long",
+                "too many tokens",
+            )
+        ):
+            raise ProviderContextLengthError("provider rejected request for context length")
     raise RuntimeError(f"LLM request failed with HTTP {response.status_code}")
 
 
@@ -64,6 +116,8 @@ class DeepSeekClient:
     model: str
     timeout: float = 60.0
     budget_controller: BudgetController | None = field(default=None, repr=False)
+    context_budget: ContextWindowBudget | None = field(default=None, repr=False)
+    context_profile_key: str | None = None
     _client: httpx.AsyncClient = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -121,6 +175,44 @@ class DeepSeekClient:
         except Exception:  # noqa: BLE001
             LOGGER.exception("failed to release undispatched model reservation")
 
+    def _prepare_context_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Apply usage caps and the context-window gate before request reservation/dispatch."""
+        controller = self.budget_controller
+        prepared: dict[str, Any] = (
+            controller.prepare_payload(payload) if controller is not None else dict(payload)
+        )
+        if self.context_budget is None:
+            return prepared
+        prepared, decision = self.context_budget.prepare_payload(prepared, self.context_profile_key)
+        self._log_context_budget_decision(decision)
+        return prepared
+
+    @staticmethod
+    def _log_context_budget_decision(decision: ContextBudgetDecision) -> None:
+        fields = (
+            decision.mode,
+            decision.profile_key,
+            decision.profile_status,
+            decision.estimated_input_tokens,
+            decision.context_window_tokens,
+            decision.safety_margin_tokens,
+            decision.effective_output_tokens,
+            decision.within_estimate,
+            decision.estimate_method,
+        )
+        if decision.mode == "shadow" and decision.within_estimate is False:
+            LOGGER.warning(
+                "context window shadow estimate exceeds profile: mode=%s profile=%s status=%s "
+                "input_estimate=%s window=%s safety=%s output=%s within=%s estimator=%s",
+                *fields,
+            )
+        elif decision.mode != "off":
+            LOGGER.debug(
+                "context window decision: mode=%s profile=%s status=%s input_estimate=%s "
+                "window=%s safety=%s output=%s within=%s estimator=%s",
+                *fields,
+            )
+
     async def _renew_reservation_during_stream(
         self,
         reservation: BudgetReservation,
@@ -154,27 +246,37 @@ class DeepSeekClient:
         payload: dict[str, Any],
     ) -> tuple[dict[str, Any], ProviderUsage | None]:
         controller = self.budget_controller
-        if controller is not None:
-            payload = controller.prepare_payload(payload)
-        # Build / serialize locally before reserving; invalid requests cannot
-        # consume a request slot or reach the provider.
-        try:
-            request = self._client.build_request("POST", url, json=payload)
-        except httpx.HTTPError:
-            raise RuntimeError("LLM request could not be constructed") from None
         reservation = None
         slot = controller.model_request_slot() if controller is not None else _empty_async_context()
         async with slot:
-            if controller is not None:
-                scope = current_budget_scope()
-                reservation = await controller.reserve_budget(
-                    scope=scope,
-                    request_id=scope.request_id if scope else str(uuid.uuid4()),
-                    model=self.model,
-                    request_payload=payload,
-                    max_output_tokens=payload.get("max_tokens"),
-                )
-            return await self._dispatch_json_request(request, reservation)
+            for attempt in range(2):
+                payload = self._prepare_context_payload(payload)
+                # Build / serialize locally before reserving; invalid requests
+                # cannot consume a request slot or reach the provider.
+                try:
+                    request = self._client.build_request("POST", url, json=payload)
+                except httpx.HTTPError:
+                    raise RuntimeError("LLM request could not be constructed") from None
+                if controller is not None:
+                    scope = current_budget_scope()
+                    reservation = await controller.reserve_budget(
+                        scope=scope,
+                        request_id=scope.request_id if scope else str(uuid.uuid4()),
+                        model=self.model,
+                        request_payload=payload,
+                        max_output_tokens=payload.get("max_tokens"),
+                    )
+                try:
+                    return await self._dispatch_json_request(request, reservation)
+                except ProviderContextLengthError:
+                    current = payload.get("max_tokens")
+                    if attempt != 0 or isinstance(current, bool) or not isinstance(current, int) or current <= 128:
+                        raise RuntimeError(
+                            "Provider rejected the request context window after one bounded retry"
+                        ) from None
+                    payload = dict(payload)
+                    payload["max_tokens"] = max(128, current // 2)
+            raise RuntimeError("Provider rejected the request context window")
 
     async def _dispatch_json_request(
         self,
@@ -241,6 +343,9 @@ class DeepSeekClient:
             # reasoning_content. Retry once with enough room for the final answer.
             if attempt == 0 and max_tokens is not None:
                 payload["max_tokens"] = max(1200, max_tokens * 3)
+                # A reasoning retry is still a distinct provider request. Re-run
+                # both usage and context gates instead of bypassing the profile.
+                payload = self._prepare_context_payload(payload)
                 continue
             raise RuntimeError("LLM returned empty content")
         raise RuntimeError("LLM returned empty content")
@@ -250,6 +355,7 @@ class DeepSeekClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         temperature: float = 0.25,
+        max_tokens: int = 2048,
         presence_penalty: float | None = None,
         frequency_penalty: float | None = None,
     ) -> ChatWithToolsResponse:
@@ -267,7 +373,7 @@ class DeepSeekClient:
             "temperature": temperature,
             "tools": tools,
             "tool_choice": "auto",
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
         }
         if presence_penalty is not None:
             payload["presence_penalty"] = presence_penalty
@@ -324,68 +430,82 @@ class DeepSeekClient:
         if frequency_penalty is not None:
             payload["frequency_penalty"] = frequency_penalty
         controller = self.budget_controller
-        if controller is not None:
-            payload = controller.prepare_payload(payload)
-        try:
-            request = self._client.build_request("POST", url, json=payload)
-        except httpx.HTTPError:
-            raise RuntimeError("LLM request could not be constructed") from None
         slot = controller.model_request_slot() if controller is not None else _empty_async_context()
         async with slot:
-            reservation = None
-            if controller is not None:
-                scope = current_budget_scope()
-                reservation = await controller.reserve_budget(
-                    scope=scope,
-                    request_id=scope.request_id if scope else str(uuid.uuid4()),
-                    model=self.model,
-                    request_payload=payload,
-                    max_output_tokens=payload.get("max_tokens"),
-                )
+            for attempt in range(2):
+                payload = self._prepare_context_payload(payload)
+                try:
+                    request = self._client.build_request("POST", url, json=payload)
+                except httpx.HTTPError:
+                    raise RuntimeError("LLM request could not be constructed") from None
+                reservation = None
+                if controller is not None:
+                    scope = current_budget_scope()
+                    reservation = await controller.reserve_budget(
+                        scope=scope,
+                        request_id=scope.request_id if scope else str(uuid.uuid4()),
+                        model=self.model,
+                        request_payload=payload,
+                        max_output_tokens=payload.get("max_tokens"),
+                    )
 
-            response: httpx.Response | None = None
-            usage: ProviderUsage | None = None
-            renewal_task = (
-                asyncio.create_task(
-                    self._renew_reservation_during_stream(reservation),
-                    name="llm-budget-stream-lease",
+                response: httpx.Response | None = None
+                usage: ProviderUsage | None = None
+                renewal_task = (
+                    asyncio.create_task(
+                        self._renew_reservation_during_stream(reservation),
+                        name="llm-budget-stream-lease",
+                    )
+                    if reservation is not None
+                    else None
                 )
-                if reservation is not None
-                else None
-            )
-            try:
-                response = await self._client.send(request, stream=True)
-                _raise_for_status(response)
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: ") or line == "data: [DONE]":
-                        continue
+                try:
+                    response = await self._client.send(request, stream=True)
                     try:
-                        chunk = json.loads(line[6:])
-                        reported_usage = ProviderUsage.from_payload(chunk.get("usage"))
-                        if reported_usage is not None:
-                            usage = reported_usage
-                        choices = chunk.get("choices") or []
-                        delta = choices[0].get("delta", {}).get("content") or "" if choices else ""
-                        if delta:
-                            yield delta
-                    except (json.JSONDecodeError, KeyError, IndexError, AttributeError):
-                        continue
-            except BaseException as exc:
-                await self._stop_lease_renewal(renewal_task)
-                if self._definitely_not_dispatched(exc) and response is None:
-                    await self._release_reservation(reservation, "stream_not_dispatched")
+                        await _raise_for_stream_status(response)
+                    except ProviderContextLengthError:
+                        if attempt == 0 and int(payload.get("max_tokens", 0)) > 128:
+                            await self._stop_lease_renewal(renewal_task)
+                            await self._finish_reservation(
+                                reservation, None, "stream_context_length_rejected"
+                            )
+                            payload = dict(payload)
+                            payload["max_tokens"] = max(128, int(payload["max_tokens"]) // 2)
+                            continue
+                        raise RuntimeError(
+                            "Provider rejected the streaming context window after one bounded retry"
+                        ) from None
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data: ") or line == "data: [DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(line[6:])
+                            reported_usage = ProviderUsage.from_payload(chunk.get("usage"))
+                            if reported_usage is not None:
+                                usage = reported_usage
+                            choices = chunk.get("choices") or []
+                            delta = choices[0].get("delta", {}).get("content") or "" if choices else ""
+                            if delta:
+                                yield delta
+                        except (json.JSONDecodeError, KeyError, IndexError, AttributeError):
+                            continue
+                except BaseException as exc:
+                    await self._stop_lease_renewal(renewal_task)
+                    if self._definitely_not_dispatched(exc) and response is None:
+                        await self._release_reservation(reservation, "stream_not_dispatched")
+                    else:
+                        await self._finish_reservation(reservation, None, "stream_outcome_unknown")
+                    if isinstance(exc, httpx.HTTPError):
+                        raise RuntimeError(f"LLM transport failed ({type(exc).__name__})") from None
+                    raise
                 else:
-                    await self._finish_reservation(reservation, None, "stream_outcome_unknown")
-                if isinstance(exc, httpx.HTTPError):
-                    raise RuntimeError(f"LLM transport failed ({type(exc).__name__})") from None
-                raise
-            else:
-                await self._stop_lease_renewal(renewal_task)
-                await self._finish_reservation(
-                    reservation,
-                    usage,
-                    "stream_completed" if usage is not None else "stream_usage_unknown",
-                )
-            finally:
-                if response is not None:
-                    await response.aclose()
+                    await self._stop_lease_renewal(renewal_task)
+                    await self._finish_reservation(
+                        reservation,
+                        usage,
+                        "stream_completed" if usage is not None else "stream_usage_unknown",
+                    )
+                    return
+                finally:
+                    if response is not None:
+                        await response.aclose()

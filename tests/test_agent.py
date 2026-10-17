@@ -7,6 +7,7 @@ from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
 from app.llm import ChatWithToolsResponse, ToolCallRequest
+from app.context.contracts import ContextEpochChanged
 from app.models import SearchResult
 from app.tools.agent import TOOL_REGISTRY
 from app.tools.contracts import search_results_to_tool_result
@@ -53,6 +54,27 @@ class _ToolRequestLLM:
 
 
 class AgentLoopTest(IsolatedAsyncioTestCase):
+    async def test_context_guard_prevents_stale_model_dispatch(self) -> None:
+        llm = _FakeLLM()
+
+        async def stale_context() -> bool:
+            return False
+
+        with self.assertRaises(ContextEpochChanged):
+            await run_agent_loop(
+                llm,
+                [{"role": "user", "content": "request"}],
+                max_rounds=2,
+                max_calls_per_round=1,
+                max_total_calls=1,
+                total_timeout=5,
+                tool_timeout=1,
+                results_max_chars=1000,
+                context_guard=stale_context,
+            )
+
+        self.assertEqual(llm.round, 0)
+
     def test_reversed_ftb_task_relation_is_rejected(self) -> None:
         messages = [
             {

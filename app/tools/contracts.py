@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 import re
-from typing import Any, Awaitable, Callable, Mapping, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Literal, Mapping, TYPE_CHECKING
 
 from app.models import SearchResult
 from app.usage_budget import BudgetScope, ToolUsage
@@ -50,6 +50,9 @@ class Evidence:
     pack_id: str | None = None
     pack_version: str | None = None
     confidence: str | None = None
+    completeness: Literal["complete", "partial", "reference_only", "unavailable"] = "reference_only"
+    content_hash: str | None = None
+    query_conditions: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +101,7 @@ class ToolContext:
     group_id: str = ""
     user_id: str = ""
     session_id: str | None = None
+    context_epoch: int | None = None
     deadline_monotonic: float | None = None
     cancel_scope: object | None = field(default=None, repr=False, compare=False)
     policy_snapshot: PolicySnapshot = field(default_factory=PolicySnapshot)
@@ -155,6 +159,7 @@ class ToolResult:
     evidence: tuple[Evidence, ...] = ()
     usage: ToolUsage = field(default_factory=ToolUsage)
     error: ToolError | None = None
+    completeness: Literal["complete", "partial", "reference_only", "unavailable"] = "complete"
 
 
 def search_results_to_tool_result(results: list[SearchResult]) -> ToolResult:

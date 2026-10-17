@@ -45,7 +45,7 @@ class ToolRegistryCompatibilityTest(IsolatedAsyncioTestCase):
         }
         self.assertEqual(
             TOOL_REGISTRY.names(),
-            frozenset(expected) | {"repository_search", "repository_read"},
+            frozenset(expected) | {"repository_search", "repository_read", "task_evidence_read"},
         )
         for name, (handler_name, access) in expected.items():
             spec = TOOL_REGISTRY.get(name)

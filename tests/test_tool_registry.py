@@ -39,7 +39,7 @@ class ToolRegistrySchemaTest(TestCase):
         schemas = TOOL_REGISTRY.openai_schemas()
         old_schemas = schemas[:10]
         serialized = json.dumps(old_schemas, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        self.assertEqual(len(schemas), 16)
+        self.assertEqual(len(schemas), 17)
         self.assertEqual(
             {schema["function"]["name"] for schema in schemas[10:]},
             {
@@ -49,6 +49,7 @@ class ToolRegistrySchemaTest(TestCase):
                 "recipe_machine_lookup",
                 "sfm_examples",
                 "sfm_generate_validate",
+                "task_evidence_read",
             },
         )
         self.assertEqual(

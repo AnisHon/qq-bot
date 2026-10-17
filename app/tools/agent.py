@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import dataclass
 import json
 import logging
@@ -10,9 +11,14 @@ from typing import Any, Mapping
 from app.llm import ChatWithToolsResponse, DeepSeekClient, ToolCallRequest
 from app.models import SearchResult
 from app.tools.contracts import (
+    Evidence,
     PolicySnapshot,
+    ToolAccess,
     ToolContext,
+    ToolPolicy,
+    ToolOutputKind,
     ToolResult,
+    ToolSpec,
     ToolStatus,
     format_search_results,
     tool_result_to_search_results,
@@ -20,6 +26,10 @@ from app.tools.contracts import (
 from app.tools.legacy_tools import build_legacy_tool_specs
 from app.tools.registry import ToolRegistry
 from app.usage_budget import current_budget_scope
+from app.context.contracts import ContextEpochChanged, WorkingState
+from app.context.contracts import ContextMessagePlan
+from app.context.budget import ContextWindowError
+from app.context.compaction import AgentContextCompactor, EvidenceStore, ProtocolBlock
 
 
 LOGGER = logging.getLogger(__name__)
@@ -354,8 +364,107 @@ _LEGACY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
 ]
 
+async def _task_evidence_read(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    store = context.extensions.get("agent_evidence_store")
+    if not isinstance(store, EvidenceStore) or context.context_epoch is None:
+        return ToolResult(
+            status=ToolStatus.DATA_UNAVAILABLE,
+            content="This request has no readable cached evidence.",
+            completeness="unavailable",
+        )
+    record_id = str(arguments["ref_id"])
+    offset = int(arguments.get("offset", 0))
+    limit = int(arguments.get("limit", 3000))
+    if offset > 16 * 1024 or not 1 <= limit <= 3000:
+        return ToolResult(
+            status=ToolStatus.INVALID_ARGUMENT,
+            content="Evidence read range is outside the bounded request-local range.",
+            completeness="unavailable",
+        )
+    evidence_request_id = context.extensions.get("agent_evidence_request_id")
+    if not isinstance(evidence_request_id, str) or not evidence_request_id:
+        return ToolResult(
+            status=ToolStatus.DATA_UNAVAILABLE,
+            content="This request has no readable cached evidence scope.",
+            completeness="unavailable",
+        )
+    scope = {
+        "request_id": evidence_request_id,
+        "group_id": context.group_id,
+        "user_id": context.user_id,
+        "epoch": context.context_epoch,
+    }
+    segment = store.read_segment(record_id, **scope, offset=offset, limit=limit)
+    metadata = store.metadata_for(record_id, **scope)
+    if segment is None or metadata is None:
+        return ToolResult(
+            status=ToolStatus.DATA_UNAVAILABLE,
+            content="Evidence reference is unavailable, expired, or outside this request's scope.",
+            completeness="unavailable",
+        )
+    completeness = segment.completeness
+    content = json.dumps({
+        "ref_id": record_id,
+        "offset": segment.offset,
+        "next_offset": segment.next_offset,
+        "completeness": completeness,
+        "source": metadata,
+        "content": segment.content,
+    }, ensure_ascii=False, separators=(",", ":"))
+    evidence = Evidence(
+        kind=str(metadata["kind"]),
+        source_id=str(metadata["source_id"]),
+        title=str(metadata["title"]),
+        locator=str(metadata["locator"]),
+        revision=metadata["revision"],
+        pack_id=metadata["pack_id"],
+        pack_version=metadata["pack_version"],
+        confidence=metadata["confidence"],
+        completeness=completeness,
+        content_hash=metadata["source_hash"] or segment.content_hash,
+        query_conditions=tuple(sorted(metadata["query_conditions"].items())),
+    )
+    return ToolResult(
+        status=ToolStatus.OK if completeness == "complete" else ToolStatus.PARTIAL,
+        content=content,
+        evidence=(evidence,),
+        completeness=completeness,
+    )
+
+
+def _task_evidence_read_spec() -> ToolSpec:
+    return ToolSpec(
+        name="task_evidence_read",
+        description=(
+            "Read a bounded character segment from evidence already returned in this Agent request. "
+            "Use the exact ref_id shown in a tool result; pass next_offset to continue. This never "
+            "reads another request or grants new domain permissions. If the source is partial or "
+            "unavailable, report that status and rerun the authorized domain tool for a narrower result."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "ref_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "offset": {"type": "integer", "minimum": 0, "maximum": 16384},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 3000},
+            },
+            "required": ["ref_id"],
+            "additionalProperties": False,
+        },
+        handler=_task_evidence_read,
+        policy=ToolPolicy(access=ToolAccess.LOCAL_READ, allowed_roles=frozenset({"group_member"})),
+        timeout_seconds=2.0,
+        max_concurrency=4,
+        max_result_chars=8192,
+        output_kind=ToolOutputKind.EVIDENCE,
+    )
+
+
 def _build_legacy_registry() -> ToolRegistry:
-    return ToolRegistry(build_legacy_tool_specs(_LEGACY_TOOL_DEFINITIONS), frozen=True)
+    registry = ToolRegistry(build_legacy_tool_specs(_LEGACY_TOOL_DEFINITIONS))
+    registry.register(_task_evidence_read_spec())
+    registry.freeze()
+    return registry
 
 
 TOOL_REGISTRY = _build_legacy_registry()
@@ -377,7 +486,11 @@ async def _safe_chat_with_tools(client: Any, messages: list[dict[str, Any]], too
         return await client.chat_with_tools(messages, tools=tools, **kwargs)
     except TypeError:
         basic_kwargs = {k: v for k, v in kwargs.items() if k in ("temperature", "max_tokens")}
-        return await client.chat_with_tools(messages, tools=tools, **basic_kwargs)
+        try:
+            return await client.chat_with_tools(messages, tools=tools, **basic_kwargs)
+        except TypeError:
+            basic_kwargs.pop("max_tokens", None)
+            return await client.chat_with_tools(messages, tools=tools, **basic_kwargs)
 
 
 # ── Native-function-calling agent loop ───────────────────────────────────────
@@ -400,6 +513,12 @@ async def run_agent_loop(
     tool_extensions: Mapping[str, Any] | None = None,
     deadline: float | None = None,
     policy_snapshot: PolicySnapshot | None = None,
+    context_guard=None,
+    context_plan: tuple[ContextMessagePlan, ...] | list[ContextMessagePlan] = (),
+    context_epoch: int | None = None,
+    working_state: WorkingState | None = None,
+    working_memory=None,
+    on_context_compaction=None,
 ) -> str:
     """Agentic tool-use loop using DeepSeek native function calling.
 
@@ -422,32 +541,92 @@ async def run_agent_loop(
         # group-member Agent path. Application callers pass an event snapshot.
         policy_snapshot = PolicySnapshot(roles=frozenset({"group_member"}))
     budget_scope = current_budget_scope()
+    base_messages = deepcopy(messages)
+    protocol_blocks: list[ProtocolBlock] = []
+    compactor = AgentContextCompactor()
+    evidence_store = EvidenceStore()
+    request_id = budget_scope.request_id if budget_scope is not None else f"agent-{id(messages)}"
+    request_group_id = (budget_scope.group_id or "") if budget_scope is not None else ""
+    request_user_id = (budget_scope.user_id or "") if budget_scope is not None else ""
+    context_budget = getattr(llm, "context_budget", None)
+    profile_key = getattr(llm, "context_profile_key", None)
+    counted_removed_context: set[str] = set()
+    counted_archived_rounds: set[int] = set()
+
+    async def record_compaction(fitted) -> None:
+        if on_context_compaction is None:
+            return
+        new_removed = set(fitted.removed_context_keys) - counted_removed_context
+        new_archived = set(fitted.archived_rounds) - counted_archived_rounds
+        if not new_removed and not new_archived:
+            return
+        counted_removed_context.update(new_removed)
+        counted_archived_rounds.update(new_archived)
+        try:
+            await on_context_compaction(len(new_archived), len(new_removed))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("could not record context compaction metrics (%s)", type(exc).__name__)
+
+    runtime_tool_extensions = dict(tool_extensions or {})
+    # This request-local reader is injected after caller extensions so it cannot
+    # be replaced by arbitrary extension data.
+    runtime_tool_extensions["agent_evidence_store"] = evidence_store
+
+    async def save_working_state(*, status: str | None = None, **changes) -> None:
+        nonlocal working_state
+        if working_state is None or working_memory is None:
+            return
+        working_state = await working_memory.checkpoint(working_state, status=status, **changes)
+
     allowed_names = TOOL_REGISTRY.names(
         policy_snapshot,
         group_id=budget_scope.group_id or "" if budget_scope is not None else "",
         user_id=budget_scope.user_id or "" if budget_scope is not None else "",
     )
 
+    if working_state is not None and working_memory is not None:
+        working_state = await working_memory.start(working_state)
+
     for _round in range(max_rounds):
         remaining = deadline - loop.time()
         if remaining <= 0:
             break
+        if context_guard is not None and not await context_guard():
+            raise ContextEpochChanged("context epoch changed before Agent model dispatch")
+        schemas = TOOL_REGISTRY.openai_schemas(
+            policy_snapshot,
+            group_id=budget_scope.group_id or "" if budget_scope is not None else "",
+            user_id=budget_scope.user_id or "" if budget_scope is not None else "",
+        )
         try:
+            fitted = compactor.fit(
+                base_messages, context_plan, protocol_blocks,
+                model=str(getattr(llm, "model", "unknown")),
+                tool_schemas=schemas,
+                budget=context_budget,
+                profile_key=profile_key,
+                working_state=_working_state_prompt_data(working_state) if working_state is not None else None,
+            )
+            await record_compaction(fitted)
+            messages[:] = [dict(message) for message in fitted.messages]
             response = await asyncio.wait_for(
                 _safe_chat_with_tools(
                     llm,
                     messages,
-                    tools=TOOL_REGISTRY.openai_schemas(
-                        policy_snapshot,
-                        group_id=budget_scope.group_id or "" if budget_scope is not None else "",
-                        user_id=budget_scope.user_id or "" if budget_scope is not None else "",
-                    ),
+                    tools=schemas,
                     temperature=min(temperature, 0.5),
+                    max_tokens=fitted.max_tokens,
                     presence_penalty=presence_penalty,
                     frequency_penalty=frequency_penalty,
                 ),
                 timeout=remaining,
             )
+        except ContextWindowError:
+            if working_state is not None and working_memory is not None and working_state.status == "running":
+                await save_working_state(status="failed")
+            raise
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("agent planning round failed: %s", exc)
             break
@@ -467,8 +646,13 @@ async def run_agent_loop(
                 # native conversation, so it is already the agent's synthesis.
                 # Re-prompting here adds latency and can make a second answer
                 # ignore evidence that the first answer used correctly.
+                await save_working_state(status="completed")
                 return _append_references(_validate_research_answer(last_text, messages), references)
+            await save_working_state(status="completed")
             return last_text
+
+        if context_guard is not None and not await context_guard():
+            raise ContextEpochChanged("context epoch changed before Agent tool execution")
 
         LOGGER.info("agent round %d requested tools: %s", _round + 1, [tc.name for tc in response.tool_calls])
 
@@ -491,7 +675,7 @@ async def run_agent_loop(
             except Exception:  # noqa: BLE001
                 pass
 
-        # ── Append assistant message with pending tool calls ─────────────
+        # ── Build one indivisible assistant-call / tool-result block ─────
         assistant_message: dict[str, Any] = {
             "role": "assistant",
             "content": response.text,  # may be None — that's fine per spec
@@ -500,7 +684,6 @@ async def run_agent_loop(
         # Preserve provider-specific tool-call extensions when present.
         if response.extra_content:
             assistant_message["extra_content"] = response.extra_content
-        messages.append(assistant_message)
 
         # ── Execute all requested tools (concurrently) ───────────────────
         valid_calls = []
@@ -554,7 +737,9 @@ async def run_agent_loop(
                     result_max_chars=per_result_chars,
                     policy_snapshot=policy_snapshot,
                     local_knowledge_search=local_knowledge_search,
-                    tool_extensions=tool_extensions,
+                    tool_extensions=runtime_tool_extensions,
+                    context_epoch=context_epoch,
+                    request_id=request_id,
                 ),
                 name=f"agent-tool-{index}",
             )
@@ -579,15 +764,45 @@ async def run_agent_loop(
                     task.cancel()
             if tool_tasks:
                 await asyncio.gather(*tool_tasks, return_exceptions=True)
+            if working_state is not None and working_memory is not None and working_state.status == "running":
+                try:
+                    await asyncio.shield(save_working_state(status="cancelled"))
+                except Exception:  # noqa: BLE001
+                    LOGGER.warning("could not persist cancellation checkpoint")
             raise
         executed_calls += len(valid_calls)
 
+        observations: dict[str, str] = {}
+        evidence_refs: list[str] = []
+        evidence_by_call: dict[str, tuple[str, ...]] = {}
+        evidence_metadata: list[dict[str, Any]] = []
+        result_statuses: dict[str, str] = {}
         for tc, result in zip(valid_calls, results):
             if isinstance(result, BaseException):
-                content = f"工具 {tc.name} 执行出错: {result}"
-                LOGGER.warning("tool %s failed: %s", tc.name, result)
+                content = f"工具 {tc.name} 执行失败。"
+                result_statuses[tc.id] = "error"
+                LOGGER.warning("tool %s failed (%s)", tc.name, type(result).__name__)
             else:
                 content = _format_tool_observation(result, per_result_chars)
+                result_statuses[tc.id] = result.status.value
+                result_refs = evidence_store.add_result(
+                    result,
+                    request_id=request_id,
+                    group_id=request_group_id,
+                    user_id=request_user_id,
+                    epoch=context_epoch if context_epoch is not None else 0,
+                    tool_call_id=tc.id,
+                )
+                evidence_by_call[tc.id] = result_refs
+                evidence_refs.extend(result_refs)
+                for ref in result_refs:
+                    metadata = evidence_store.metadata_for(
+                        ref, request_id=request_id, group_id=request_group_id,
+                        user_id=request_user_id, epoch=context_epoch if context_epoch is not None else 0,
+                    )
+                    if metadata is not None:
+                        evidence_metadata.append(metadata)
+                content = _append_evidence_refs(content, result_refs, per_result_chars)
                 for item in result.evidence:
                     is_document = item.kind == "document" and bool(item.locator)
                     is_web_source = item.locator.startswith(("http://", "https://"))
@@ -611,32 +826,67 @@ async def run_agent_loop(
                         reference = (priority, item.title, item.locator)
                         if reference not in references:
                             references.append(reference)
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": content,
-                }
-            )
+            observations[tc.id] = content
 
         # DeepSeek requires exactly one tool response for every tool_call id.
         # This includes unknown, duplicate and budget-skipped calls.
         for tc in response.tool_calls:
             if tc.id in skipped:
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": skipped[tc.id],
-                    }
-                )
+                observations[tc.id] = skipped[tc.id]
+                result_statuses[tc.id] = "skipped"
+
+        block = ProtocolBlock(
+            round_index=_round + 1,
+            messages=(
+                assistant_message,
+                *(
+                    {"role": "tool", "tool_call_id": tc.id,
+                     "content": observations.get(tc.id, "Tool result unavailable.")}
+                    for tc in response.tool_calls
+                ),
+            ),
+            evidence_refs=tuple(dict.fromkeys(evidence_refs)),
+            result_statuses=tuple(result_statuses.items()),
+            evidence_by_call=tuple((call_id, refs) for call_id, refs in evidence_by_call.items()),
+            evidence_metadata=tuple(evidence_metadata),
+        )
+        compactor.validate_protocol_block(block)
+        protocol_blocks.append(block)
+
+        if working_state is not None and working_memory is not None:
+            step_updates = tuple(
+                f"{tc.name}: {result_statuses.get(tc.id, 'unknown')}"
+                for tc in response.tool_calls
+            )
+            failures = tuple(
+                f"{tc.name}: {result_statuses.get(tc.id, 'unknown')}"
+                for tc in response.tool_calls
+                if result_statuses.get(tc.id) not in {"ok", "no_results"}
+            )
+            await save_working_state(
+                completed_steps=tuple((*working_state.completed_steps, *step_updates)[-32:]),
+                open_questions=tuple((*working_state.open_questions, *failures)[-32:]),
+                evidence_refs=tuple(dict.fromkeys((*working_state.evidence_refs, *evidence_refs)))[-64:],
+            )
 
         if not valid_calls:
             break
 
     # Max rounds reached — ask for a final answer without offering tools
     LOGGER.debug("agent_loop hit max_rounds=%d, requesting final answer", max_rounds)
+    if context_guard is not None and not await context_guard():
+        raise ContextEpochChanged("context epoch changed before Agent final synthesis")
     try:
+        final_fit = compactor.fit(
+            base_messages, context_plan, protocol_blocks,
+            model=str(getattr(llm, "model", "unknown")),
+            tool_schemas=None,
+            budget=context_budget,
+            profile_key=profile_key,
+            working_state=_working_state_prompt_data(working_state) if working_state is not None else None,
+        )
+        await record_compaction(final_fit)
+        messages[:] = [dict(message) for message in final_fit.messages]
         final_messages = _build_final_answer_messages(messages, results_max_chars * 2)
         remaining = deadline - loop.time()
         if remaining <= 0:
@@ -647,16 +897,27 @@ async def run_agent_loop(
                 llm,
                 final_messages,
                 temperature=temperature,
+                max_tokens=final_fit.max_tokens,
                 presence_penalty=presence_penalty,
                 frequency_penalty=frequency_penalty,
             ),
             timeout=final_timeout,
         )
         candidate = str(final).strip()
+        await save_working_state(status="completed")
         if executed_calls:
             return _append_references(_validate_research_answer(candidate, messages), references)
         return candidate
+    except ContextWindowError:
+        if working_state is not None and working_memory is not None and working_state.status == "running":
+            await save_working_state(status="failed")
+        raise
     except Exception as exc:  # noqa: BLE001
+        if working_state is not None and working_memory is not None and working_state.status == "running":
+            try:
+                await save_working_state(status="failed")
+            except Exception:  # noqa: BLE001
+                LOGGER.warning("could not persist failed task checkpoint")
         return last_text or f"（工具执行完毕，但生成最终回复失败: {exc}）"
 
 
@@ -670,13 +931,16 @@ async def _dispatch_registered_tool_call(
     policy_snapshot: PolicySnapshot | None = None,
     local_knowledge_search=None,
     tool_extensions: Mapping[str, Any] | None = None,
+    context_epoch: int | None = None,
+    request_id: str | None = None,
 ) -> ToolResult:
     budget_scope = current_budget_scope()
-    request_id = budget_scope.request_id if budget_scope is not None else f"agent-{call.id}"
+    tool_request_id = budget_scope.request_id if budget_scope is not None else f"agent-{call.id}"
     context = ToolContext(
-        request_id=request_id,
+        request_id=tool_request_id,
         group_id=budget_scope.group_id or "" if budget_scope is not None else "",
         user_id=budget_scope.user_id or "" if budget_scope is not None else "",
+        context_epoch=context_epoch,
         deadline_monotonic=deadline,
         cancel_scope=asyncio.current_task(),
         policy_snapshot=policy_snapshot or PolicySnapshot(roles=frozenset({"group_member"})),
@@ -688,6 +952,7 @@ async def _dispatch_registered_tool_call(
         extensions={
             "local_knowledge_search": local_knowledge_search,
             **(dict(tool_extensions) if tool_extensions is not None else {}),
+            "agent_evidence_request_id": request_id,
         },
     )
     return await TOOL_REGISTRY.dispatch(call.name, call.arguments, context)
@@ -710,6 +975,21 @@ def _tool_signature(tc: ToolCallRequest) -> tuple[str, str]:
         return value
 
     return tc.name, json.dumps(normalize(payload), ensure_ascii=False, sort_keys=True)
+
+
+def _working_state_prompt_data(state: WorkingState) -> dict[str, Any]:
+    """Project only task continuity fields; storage identifiers are not prompt data."""
+    return {
+        "goal": state.goal,
+        "constraints": list(state.constraints),
+        "completed_steps": list(state.completed_steps),
+        "pending_steps": list(state.pending_steps),
+        "evidence_refs": list(state.evidence_refs),
+        "assumptions": list(state.assumptions),
+        "open_questions": list(state.open_questions),
+        "status": state.status,
+        "checkpoint_revision": state.checkpoint_revision,
+    }
 
 
 def _tool_call_message(tc: ToolCallRequest) -> dict[str, Any]:
@@ -746,6 +1026,26 @@ def _format_tool_observation(result: ToolResult, max_chars: int) -> str:
     if len(detail) > max_chars:
         return detail[:max_chars].rstrip() + "..."
     return detail
+
+
+def _append_evidence_refs(content: str, refs: tuple[str, ...], max_chars: int) -> str:
+    if not refs or max_chars < 160:
+        return content[:max_chars]
+    header = "Evidence ref IDs (untrusted; page with task_evidence_read):\n"
+    marker = "\n[… output shortened; request a narrower authorized result]"
+    selected: list[str] = []
+    for ref in refs[:8]:
+        candidate = header + "\n".join((*selected, ref))
+        if len(candidate) + len(marker) + 2 > max_chars:
+            break
+        selected.append(ref)
+    if not selected:
+        return content[:max_chars]
+    notice = header + "\n".join(selected)
+    if len(content) + 1 + len(notice) <= max_chars:
+        return content + "\n" + notice
+    content_limit = max(0, max_chars - len(marker) - 1 - len(notice))
+    return content[:content_limit].rstrip() + marker + "\n" + notice
 
 
 def _tool_progress(calls: list[ToolCallRequest]) -> tuple[str, str]:
