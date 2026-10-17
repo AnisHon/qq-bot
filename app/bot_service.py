@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from app.config import Settings
+from app.context.contracts import ContextSnapshot
 from app.llm import DeepSeekClient
 from app.memory import MemoryStore
 from app.models import ChatReply, GroupMessageEvent
@@ -85,13 +86,22 @@ class BotService:
             return self._command_service.renderer.render(result)
 
         memory_content = _message_content_for_memory(event)
-        await self._storage_call(
-            self.memory.add_message,
+        if len(memory_content.encode("utf-8")) > self.settings.context_max_user_input_bytes:
+            if self._should_reply(event):
+                return ChatReply(
+                    text="这条消息超过上下文输入长度限制，请拆分后重发。超长原文未保存，也不会交给模型。"
+                )
+            return None
+        snapshot = await self._storage_call(
+            self.memory.record_message_snapshot,
             group_id=event.group_id,
             user_id=event.user_id,
             nickname=event.nickname,
-            role="user",
             content=memory_content,
+            request_id=str(event.message_id),
+            onebot_message_id=str(event.message_id) if event.message_id else None,
+            reply_message_id=event.reply_message_id or None,
+            event_timestamp=event.timestamp,
         )
 
         if not self._should_reply(event):
@@ -110,7 +120,7 @@ class BotService:
         try:
             try:
                 reply_text = await self._llm_handler._reply_with_llm(
-                    event, on_tool_call=on_tool_call
+                    event, on_tool_call=on_tool_call, context_snapshot=snapshot
                 )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("LLM reply failed: %s", exc)
@@ -118,15 +128,23 @@ class BotService:
             finally:
                 reset_budget_scope(budget_token)
             if reply_text:
-                await self._storage_call(
-                    self.memory.add_message,
-                    group_id=event.group_id,
-                    user_id=self.settings.bot_qq_id or "bot",
-                    nickname="bot",
-                    role="assistant",
-                    content=reply_text,
+                stored = False
+                if snapshot.persisted:
+                    stored = await self._storage_call(
+                        self.memory.record_assistant_if_epoch,
+                        snapshot,
+                        self.settings.bot_qq_id or "bot",
+                        "bot",
+                        reply_text,
+                    )
+                epoch_current = await self.is_context_epoch_current(event.group_id, snapshot.epoch)
+                if not epoch_current:
+                    return ChatReply(text="", should_send=False)
+                return ChatReply(
+                    text=reply_text,
+                    context_epoch=snapshot.epoch,
+                    context_persisted=bool(snapshot.persisted and stored),
                 )
-                return ChatReply(text=reply_text)
             return None
         finally:
             await self._end_group_reply(event.group_id)
@@ -180,13 +198,17 @@ class BotService:
         async with self._active_guard:
             return str(group_id) in self._active_groups
 
+    async def is_context_epoch_current(self, group_id: str, epoch: int) -> bool:
+        return await self._storage_call(self.memory.get_context_epoch, group_id) == int(epoch)
+
     async def run_scheduled_task(self, task: dict[str, str], on_tool_call=None) -> str | None:
         group_id = str(task["group_id"])
         if not await self._try_begin_group_reply(group_id):
             return None
         prompt = str(task["prompt"])
+        request_id = f"scheduled-task-{task['id']}-{time.time_ns()}"
         event = GroupMessageEvent(
-            message_id=f"task-{task['id']}",
+            message_id=request_id,
             group_id=group_id,
             user_id=str(task["created_by"]),
             nickname="scheduled-task",
@@ -200,27 +222,35 @@ class BotService:
             BudgetScope(
                 group_id=group_id,
                 user_id=str(task["created_by"]) if task.get("created_by") else None,
-                request_id=f"scheduled-task-{task['id']}",
+                request_id=request_id,
             )
         )
         try:
-            await self._storage_call(
-                self.memory.add_message,
+            snapshot = await self._storage_call(
+                self.memory.record_message_snapshot,
                 group_id=event.group_id,
                 user_id=event.user_id,
                 nickname=event.nickname,
-                role="user",
                 content=prompt,
+                request_id=request_id,
+                event_timestamp=event.timestamp,
             )
-            reply_text = await self._llm_handler._reply_with_llm(event, on_tool_call=on_tool_call)
-            await self._storage_call(
-                self.memory.add_message,
-                group_id=event.group_id,
-                user_id=self.settings.bot_qq_id or "bot",
-                nickname="bot",
-                role="assistant",
-                content=reply_text,
+            reply_text = await self._llm_handler._reply_with_llm(
+                event, on_tool_call=on_tool_call, context_snapshot=snapshot
             )
+            stored = False
+            if snapshot.persisted:
+                stored = await self._storage_call(
+                    self.memory.record_assistant_if_epoch,
+                    snapshot,
+                    self.settings.bot_qq_id or "bot",
+                    "bot",
+                    reply_text,
+                )
+            if snapshot.persisted and not stored and not await self.is_context_epoch_current(group_id, snapshot.epoch):
+                return None
+            if not await self.is_context_epoch_current(group_id, snapshot.epoch):
+                return None
             return reply_text
         finally:
             reset_budget_scope(budget_token)

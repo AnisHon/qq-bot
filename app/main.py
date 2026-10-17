@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 
 from app.bot_service import BotService
 from app.config import Settings
+from app.context.budget import ContextWindowBudget, profile_key
 from app.llm import DeepSeekClient
 from app.memory import MemoryStore
 from app.models import GroupMessageEvent
@@ -23,6 +24,8 @@ from app.qq_dispatcher import EventDeduplicator, QQMessageDispatcher
 from app.storage_executor import StorageExecutor
 from app.task_runtime import MessageTaskRuntime
 from app.usage_budget import BudgetController, BudgetLimits, UsageBudgetStore
+
+CONTEXT_SEARCH_OPTIMIZE_INTERVAL_SECONDS = 24 * 60 * 60
 
 # Verified working models as of 2026-08-17 (probed concurrently, timeout 20s)
 # meta/llama-3.1-8b-instruct is registered separately via NVIDIA_MODEL env var
@@ -80,7 +83,12 @@ def create_app() -> FastAPI:
     _setup_logging(settings.log_level)
     logger = logging.getLogger(__name__)
 
-    memory = MemoryStore(settings.sqlite_path, history_limit=settings.message_history_limit)
+    memory = MemoryStore(
+        settings.sqlite_path,
+        history_limit=settings.message_history_limit,
+        history_max_messages_per_group=settings.context_history_max_messages_per_group,
+        history_max_bytes_per_group=settings.context_history_max_bytes_per_group,
+    )
     rag = RagStore(settings.sqlite_path) if settings.rag_enabled else None
     from app.vector_rag import VectorRagStore
     vector_rag = VectorRagStore(settings.sqlite_path.parent / "chromadb") if settings.rag_enabled else None
@@ -104,17 +112,27 @@ def create_app() -> FastAPI:
         ),
         max_concurrent_model_requests=settings.llm_max_concurrent_requests,
     )
+    context_window_budget = ContextWindowBudget(
+        settings.llm_context_window_profiles,
+        mode=settings.llm_context_budget_mode,
+        default_output_tokens=settings.llm_context_default_output_tokens,
+    )
 
-    def _new_llm_client(api_key: str, base_url: str, model: str, timeout: float) -> DeepSeekClient:
+    def _new_llm_client(
+        provider: str, api_key: str, base_url: str, model: str, timeout: float
+    ) -> DeepSeekClient:
         return DeepSeekClient(
             api_key=api_key,
             base_url=base_url,
             model=model,
             timeout=timeout,
             budget_controller=budget_controller,
+            context_budget=context_window_budget,
+            context_profile_key=profile_key(provider, model),
         )
 
     llm = _new_llm_client(
+        "deepseek",
         api_key=settings.deepseek_api_key,
         base_url=settings.deepseek_base_url,
         model=settings.deepseek_model,
@@ -123,6 +141,7 @@ def create_app() -> FastAPI:
     llms = {"deepseek": llm}
     if settings.nvidia_api_key:
         default_nvidia = _new_llm_client(
+            "nvidia",
             api_key=settings.nvidia_api_key,
             base_url=settings.nvidia_base_url,
             model=settings.nvidia_model,
@@ -133,6 +152,7 @@ def create_app() -> FastAPI:
         for model in NVIDIA_CHAT_MODELS:
             if model.lower() not in llms:
                 llms[model.lower()] = _new_llm_client(
+                    "nvidia",
                     api_key=settings.nvidia_api_key,
                     base_url=settings.nvidia_base_url,
                     model=model,
@@ -140,6 +160,7 @@ def create_app() -> FastAPI:
                 )
     if settings.qwen_api_key:
         default_qwen = _new_llm_client(
+            "qwen",
             api_key=settings.qwen_api_key,
             base_url=settings.qwen_base_url,
             model=settings.qwen_model,
@@ -150,6 +171,7 @@ def create_app() -> FastAPI:
         for model in QWEN_CHAT_MODELS:
             if model.lower() not in llms:
                 llms[model.lower()] = _new_llm_client(
+                    "qwen",
                     api_key=settings.qwen_api_key,
                     base_url=settings.qwen_base_url,
                     model=model,
@@ -157,6 +179,7 @@ def create_app() -> FastAPI:
                 )
     if settings.newapi_api_key:
         default_newapi = _new_llm_client(
+            "newapi",
             api_key=settings.newapi_api_key,
             base_url=settings.newapi_base_url,
             model=settings.newapi_model,
@@ -167,6 +190,7 @@ def create_app() -> FastAPI:
         for model in NEWAPI_CHAT_MODELS:
             if model.lower() not in llms:
                 llms[model.lower()] = _new_llm_client(
+                    "newapi",
                     api_key=settings.newapi_api_key,
                     base_url=settings.newapi_base_url,
                     model=model,
@@ -174,6 +198,7 @@ def create_app() -> FastAPI:
                 )
     if settings.cctq_api_key:
         default_cctq = _new_llm_client(
+            "cctq",
             api_key=settings.cctq_api_key,
             base_url=settings.cctq_base_url,
             model=settings.cctq_model,
@@ -185,6 +210,7 @@ def create_app() -> FastAPI:
             alias = f"cctq/{model.lower()}"
             if alias not in llms:
                 llms[alias] = _new_llm_client(
+                    "cctq",
                     api_key=settings.cctq_api_key,
                     base_url=settings.cctq_base_url,
                     model=model,
@@ -219,7 +245,18 @@ def create_app() -> FastAPI:
     app.state.service = service
     app.state.storage_executor = storage_executor
     app.state.usage_budget_controller = budget_controller
+    app.state.context_window_budget = context_window_budget
     app.state.callback_auth_ready = adapter.callback_auth_configured
+    enabled_model_clients = {name: client for name, client in llms.items() if client.api_key}
+    active_default_client = enabled_model_clients.get(settings.default_model_provider)
+    if active_default_client is None:
+        active_default_client = next(iter(enabled_model_clients.values()), None)
+    context_profile_ready = (
+        context_window_budget.mode != "enforce"
+        or active_default_client is None
+        or context_window_budget.has_profile(active_default_client.context_profile_key)
+    )
+    app.state.context_profile_ready = context_profile_ready
     message_runtime: MessageTaskRuntime | None = None
 
     @app.on_event("shutdown")
@@ -242,6 +279,10 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def _startup() -> None:
+        if not context_profile_ready:
+            logger.error(
+                "active default model has no context-window profile; enforce mode will reject its requests"
+            )
         if not adapter.callback_auth_configured:
             logger.error(
                 "OneBot callback authentication is not configured; callbacks will be rejected"
@@ -267,7 +308,31 @@ def create_app() -> FastAPI:
             logger.exception("model usage reservation recovery failed")
         if message_runtime is not None:
             message_runtime.start()
+            message_runtime.spawn_background(
+                _rebuild_context_search_indexes(), name="context-search-fts-backfill"
+            )
         app.state.scheduler_task = asyncio.create_task(_scheduled_task_loop())
+
+    async def _rebuild_context_search_indexes() -> None:
+        while True:
+            batch = await storage_executor.run_sqlite(
+                memory.rebuild_chat_history_index_batch, limit=500
+            )
+            if batch["complete"]:
+                logger.info(
+                    "chat history FTS backfill complete: last_id=%s mode=%s",
+                    batch["last_id"], batch["mode"],
+                )
+                break
+            await asyncio.sleep(0.01)
+        while True:
+            batch = await storage_executor.run_sqlite(memory.rebuild_memory_search_batch, limit=500)
+            if batch["complete"]:
+                logger.info("memory FTS backfill complete: last_id=%s", batch["last_id"])
+                break
+            await asyncio.sleep(0.01)
+        optimized = await storage_executor.run_sqlite(memory.optimize_context_search_indexes)
+        logger.info("context search FTS segments optimized: indexes=%s", optimized["optimized_indexes"])
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -281,6 +346,11 @@ def create_app() -> FastAPI:
                     "status": "not_ready",
                     "reason": "onebot_callback_auth_not_configured",
                 },
+                status_code=503,
+            )
+        if not context_profile_ready:
+            return JSONResponse(
+                {"status": "not_ready", "reason": "active_model_context_profile_missing"},
                 status_code=503,
             )
         return JSONResponse({"status": "ready"})
@@ -358,6 +428,12 @@ def create_app() -> FastAPI:
                 reply = await task
 
             if reply and reply.should_send:
+                if (
+                    reply.context_epoch is not None
+                    and not await service.is_context_epoch_current(event.group_id, reply.context_epoch)
+                ):
+                    logger.info("discarded reply from stale context epoch")
+                    return
                 await dispatcher.send(event.group_id, reply.text, reply_to=event.message_id)
                 if not service.is_command_event(event):
                     assert message_runtime is not None
@@ -376,6 +452,9 @@ def create_app() -> FastAPI:
             request_ctx.reset(token)
 
     async def _scheduled_task_loop() -> None:
+        next_context_index_maintenance = (
+            time.monotonic() + CONTEXT_SEARCH_OPTIMIZE_INTERVAL_SECONDS
+        )
         while True:
             try:
                 now = int(time.time())
@@ -390,6 +469,21 @@ def create_app() -> FastAPI:
                 raise
             except Exception:  # noqa: BLE001
                 logger.exception("scheduled task loop failed")
+            if time.monotonic() >= next_context_index_maintenance:
+                try:
+                    optimized = await storage_executor.run_sqlite(
+                        memory.optimize_context_search_indexes
+                    )
+                    logger.info(
+                        "periodic context search FTS optimization complete: indexes=%s",
+                        optimized["optimized_indexes"],
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("periodic context search FTS optimization failed")
+                finally:
+                    next_context_index_maintenance = (
+                        time.monotonic() + CONTEXT_SEARCH_OPTIMIZE_INTERVAL_SECONDS
+                    )
             await asyncio.sleep(settings.scheduler_poll_interval)
 
     async def _run_scheduled_task(task_row: dict[str, Any]) -> None:

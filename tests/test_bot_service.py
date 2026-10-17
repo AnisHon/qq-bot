@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import tempfile
 from pathlib import Path
@@ -144,6 +145,25 @@ class CommandTest(unittest.TestCase):
             self.assertEqual(reply.text, "ordinary reply")
             self.assertEqual(llm.calls, 1)
 
+    def test_history_capacity_keeps_current_chat_ephemeral(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "bot.db"
+            settings = Settings(sqlite_path=path, agent_tools_enabled=False)
+            store = MemoryStore(path, history_max_messages_per_group=1, history_max_bytes_per_group=1024)
+            store.add_message("100", "other", "member", "user", "existing row at capacity")
+            llm = _DummyLLM("ephemeral answer")
+            service = BotService(settings=settings, memory=store, llm=llm)
+
+            reply = _run(service.handle_group_message(
+                GroupMessageEvent("overflow-1", "100", "111", "user", "new question", True, 0, {})
+            ))
+
+            self.assertEqual(reply.text, "ephemeral answer")
+            self.assertFalse(reply.context_persisted)
+            self.assertEqual(llm.calls, 1)
+            self.assertEqual(store.count_group_history("100"), 1)
+            self.assertEqual(store.get_recent_messages("100")[-1]["content"], "existing row at capacity")
+
     def test_reply_to_bot_wakes_without_text_or_at(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = Settings(sqlite_path=Path(tmpdir) / "bot.db")
@@ -194,7 +214,7 @@ class CommandTest(unittest.TestCase):
             )
             self.assertEqual(reply.text, "你没有权限执行此命令。")
 
-    def test_admin_can_clear_group_history(self) -> None:
+    def test_admin_can_reset_group_context_and_retain_raw_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = Settings(
                 bot_admin_qq_list=("1392953682",),
@@ -208,17 +228,18 @@ class CommandTest(unittest.TestCase):
             store.add_message("100", "1", "u1", "user", "hello")
             store.add_message("100", "2", "u2", "user", "world")
             store.upsert_group_summary("100", "旧摘要", 2)
-            reply = _run(svc.handle_group_message(GroupMessageEvent("1", "100", "1392953682", "admin", "/context clear", True, 0, {})))
+            reply = _run(svc.handle_group_message(GroupMessageEvent("1", "100", "1392953682", "admin", "/context reset", True, 0, {})))
             self.assertIn("请确认", reply.text)
             token = reply.text.rsplit(" ", 1)[-1]
             reply = _run(svc.handle_group_message(
                 GroupMessageEvent("2", "100", "1392953682", "admin", f"/confirm {token}", True, 0, {})
             ))
-            self.assertIn("已清除本群上下文", reply.text)
+            self.assertIn("开启新的上下文 epoch", reply.text)
             self.assertEqual(store.get_recent_messages("100"), [])
+            self.assertEqual(store.count_group_history("100"), 2)
             self.assertIsNone(store.get_group_summary("100"))
 
-    def test_normal_user_cannot_clear_group_history(self) -> None:
+    def test_normal_user_cannot_reset_group_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = Settings(
                 bot_admin_qq_list=("1392953682",),
@@ -230,7 +251,7 @@ class CommandTest(unittest.TestCase):
             store = MemoryStore(settings.sqlite_path, history_limit=20)
             svc = BotService(settings=settings, memory=store, llm=_DummyLLM())
             store.add_message("100", "1", "u1", "user", "hello")
-            reply = _run(svc.handle_group_message(GroupMessageEvent("1", "100", "111", "user", "/context clear", True, 0, {})))
+            reply = _run(svc.handle_group_message(GroupMessageEvent("1", "100", "111", "user", "/context reset", True, 0, {})))
             self.assertEqual(reply.text, "你没有权限执行此命令。")
             self.assertIn("hello", [row["content"] for row in store.get_recent_messages("100")])
 
@@ -325,7 +346,15 @@ class SplitQQTextTest(unittest.TestCase):
 
 
 class SummaryTest(unittest.TestCase):
-    def test_auto_summary_prunes_old_history(self) -> None:
+    @staticmethod
+    def _summary_reply(text: str) -> str:
+        return json.dumps({
+            "schema_version": 1, "topic": "fixture topic", "summary": text,
+            "decisions": [{"text": "fixture decision", "source_row_ids": [1]}],
+            "open_questions": [],
+        }, ensure_ascii=False)
+
+    def test_auto_summary_keeps_original_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = Settings(
                 sqlite_path=Path(tmpdir) / "bot.db",
@@ -334,7 +363,7 @@ class SummaryTest(unittest.TestCase):
                 summary_trigger_message_count=5,
             )
             store = MemoryStore(settings.sqlite_path, history_limit=20)
-            svc = BotService(settings=settings, memory=store, llm=_DummyLLM("摘要内容"))
+            svc = BotService(settings=settings, memory=store, llm=_DummyLLM(self._summary_reply("摘要内容")))
             for idx in range(5):
                 store.add_message("100", f"u{idx}", f"n{idx}", "user", f"m{idx}")
 
@@ -343,7 +372,142 @@ class SummaryTest(unittest.TestCase):
             summary = store.get_group_summary("100")
             self.assertIsNotNone(summary)
             self.assertEqual(summary["summary"], "摘要内容")
-            self.assertEqual([row["content"] for row in store.get_recent_messages("100", 10)], ["m3", "m4"])
+            self.assertEqual([row["content"] for row in store.get_recent_messages("100", 10)], [
+                "m0", "m1", "m2", "m3", "m4"
+            ])
+            self.assertEqual(summary["last_message_id"], 3)
+            episodes = store.search_episodes("fixture topic", group_id="100", epoch=0)
+            self.assertEqual(len(episodes), 1)
+            self.assertEqual(episodes[0]["summary"], "摘要内容")
+
+    def test_summary_is_single_flight_per_group(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                settings = Settings(
+                    sqlite_path=Path(tmpdir) / "bot.db",
+                    message_history_limit=20,
+                    context_recent_message_limit=2,
+                    summary_trigger_message_count=5,
+                )
+                store = MemoryStore(settings.sqlite_path, history_limit=20)
+                for idx in range(5):
+                    store.add_message("100", f"u{idx}", f"n{idx}", "user", f"m{idx}")
+
+                class BlockingSummaryLLM(_DummyLLM):
+                    def __init__(self) -> None:
+                        super().__init__(SummaryTest._summary_reply("摘要内容"))
+                        self.started = asyncio.Event()
+                        self.release = asyncio.Event()
+
+                    async def chat(self, messages, **kwargs):
+                        self.calls += 1
+                        self.started.set()
+                        await self.release.wait()
+                        return self.reply
+
+                llm = BlockingSummaryLLM()
+                service = BotService(settings=settings, memory=store, llm=llm)
+                first = asyncio.create_task(service.maybe_update_group_summary("100"))
+                await asyncio.wait_for(llm.started.wait(), timeout=1)
+                second = asyncio.create_task(service.maybe_update_group_summary("100"))
+                await asyncio.wait_for(second, timeout=1)
+                self.assertEqual(llm.calls, 1)
+                llm.release.set()
+                await asyncio.wait_for(first, timeout=1)
+                self.assertEqual(store.get_group_summary("100")["summary"], "摘要内容")
+                self.assertEqual(len(store.get_recent_messages("100", 10)), 5)
+
+        _run(scenario())
+
+    def test_clear_during_summary_prevents_stale_commit(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                settings = Settings(
+                    sqlite_path=Path(tmpdir) / "bot.db",
+                    context_recent_message_limit=2,
+                    summary_trigger_message_count=5,
+                )
+                store = MemoryStore(settings.sqlite_path)
+                for idx in range(5):
+                    store.add_message("100", f"u{idx}", f"n{idx}", "user", f"m{idx}")
+                llm = _DummyLLM(SummaryTest._summary_reply("late summary"))
+                service = BotService(settings=settings, memory=store, llm=llm)
+                entered = asyncio.Event()
+                release = asyncio.Event()
+                original_chat = llm.chat
+
+                async def blocked_chat(messages, **kwargs):
+                    entered.set()
+                    await release.wait()
+                    return await original_chat(messages, **kwargs)
+
+                llm.chat = blocked_chat
+                task = asyncio.create_task(service.maybe_update_group_summary("100"))
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                store.clear_group_context("100")
+                release.set()
+                await asyncio.wait_for(task, timeout=1)
+                self.assertIsNone(store.get_group_summary("100"))
+                self.assertEqual(store.get_recent_messages("100", 10), [])
+
+        _run(scenario())
+
+    def test_context_reset_during_summary_prevents_stale_commit_and_retains_raw_history(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                settings = Settings(
+                    sqlite_path=Path(tmpdir) / "bot.db",
+                    context_recent_message_limit=2,
+                    summary_trigger_message_count=5,
+                )
+                store = MemoryStore(settings.sqlite_path)
+                old_ids = [
+                    store.add_message("100", f"u{idx}", f"n{idx}", "user", f"m{idx}")
+                    for idx in range(5)
+                ]
+                llm = _DummyLLM(SummaryTest._summary_reply("late summary"))
+                service = BotService(settings=settings, memory=store, llm=llm)
+                entered = asyncio.Event()
+                release = asyncio.Event()
+                original_chat = llm.chat
+
+                async def blocked_chat(messages, **kwargs):
+                    entered.set()
+                    await release.wait()
+                    return await original_chat(messages, **kwargs)
+
+                llm.chat = blocked_chat
+                task = asyncio.create_task(service.maybe_update_group_summary("100"))
+                await asyncio.wait_for(entered.wait(), timeout=1)
+                store.reset_group_context("100")
+                release.set()
+                await asyncio.wait_for(task, timeout=1)
+
+                self.assertIsNone(store.get_group_summary("100"))
+                self.assertEqual(store.get_recent_messages("100", 10), [])
+                self.assertTrue(all(store.message_exists("100", row_id) for row_id in old_ids))
+
+        _run(scenario())
+
+    def test_empty_or_overlong_summary_does_not_advance_coverage(self) -> None:
+        for text in ("", "x" * 301):
+            with self.subTest(length=len(text)), tempfile.TemporaryDirectory() as tmpdir:
+                settings = Settings(
+                    sqlite_path=Path(tmpdir) / "bot.db",
+                    context_recent_message_limit=2,
+                    summary_trigger_message_count=5,
+                    summary_max_chars=300,
+                )
+                store = MemoryStore(settings.sqlite_path)
+                for idx in range(5):
+                    store.add_message("100", f"u{idx}", f"n{idx}", "user", f"m{idx}")
+                service = BotService(
+                    settings=settings, memory=store, llm=_DummyLLM(self._summary_reply(text))
+                )
+                _run(service.maybe_update_group_summary("100"))
+                self.assertIsNone(store.get_group_summary("100"))
+                candidate = store.begin_group_summary_snapshot("100", keep_recent=2, trigger_count=5)
+                self.assertIsNotNone(candidate)
 
 
 class TaskScheduleParseTest(unittest.TestCase):
@@ -450,20 +614,19 @@ class StorageOffloadIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 agent_total_timeout=10,
             )
             memory = MemoryStore(settings.sqlite_path, history_limit=20)
-            original_add_message = memory.add_message
+            original_record_message_snapshot = memory.record_message_snapshot
 
-            def blocking_add_message(*args, **kwargs) -> None:
-                role = kwargs.get("role", args[3] if len(args) > 3 else "")
-                if role == "user" and not entered.is_set():
+            def blocking_record_message_snapshot(*args, **kwargs):
+                if not entered.is_set():
                     entered.set()
                     did_release = release.wait(timeout=0.25)
                     if not did_release:
                         raise RuntimeError("test did not release blocked storage fixture")
-                original_add_message(*args, **kwargs)
-                if role == "user":
-                    finished.set()
+                result = original_record_message_snapshot(*args, **kwargs)
+                finished.set()
+                return result
 
-            memory.add_message = blocking_add_message
+            memory.record_message_snapshot = blocking_record_message_snapshot
             service = BotService(
                 settings=settings,
                 memory=memory,

@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from app.config import Settings
-from app.models import GroupMessageEvent
+from app.models import ChatReply, GroupMessageEvent
 
 _IMPORT_STATE = tempfile.TemporaryDirectory(prefix="qq-bot-main-import-")
 _root_logger = logging.getLogger()
@@ -116,6 +116,32 @@ class OneBotAdmissionTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(ready.status_code, 503)
             self.assertEqual(ready.json()["reason"], "onebot_callback_auth_not_configured")
             self.assertEqual(callback.status_code, 401)
+
+    async def test_enforce_missing_active_profile_degrades_readiness_without_startup_failure(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qq-bot-context-profile-test-") as temp_dir:
+            env = {
+                "SQLITE_PATH": str(Path(temp_dir) / "bot.db"),
+                "RAG_ENABLED": "false",
+                "NATCAPQQ_CALLBACK_TOKEN": "fixture-callback-token",
+                "DEEPSEEK_API_KEY": "fixture-only-key",
+                "DEFAULT_MODEL_PROVIDER": "deepseek",
+                "LLM_CONTEXT_BUDGET_MODE": "enforce",
+                "LLM_CONTEXT_WINDOW_PROFILES": '{"nvidia:inactive-model":{"context_window_tokens":8192}}',
+            }
+            with patch.dict(os.environ, env):
+                _root_logger.addHandler(_null_handler)
+                try:
+                    app = create_app()
+                finally:
+                    _root_logger.removeHandler(_null_handler)
+            self.assertFalse(app.state.context_profile_ready)
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    ready = await client.get("/ready")
+            self.assertEqual(ready.status_code, 503)
+            self.assertEqual(ready.json()["reason"], "active_model_context_profile_missing")
 
     async def test_napcat_http_signature_authenticates_exact_request_body(self) -> None:
         with tempfile.TemporaryDirectory(prefix="qq-bot-napcat-signature-test-") as temp_dir:
@@ -263,6 +289,55 @@ class OneBotAdmissionTest(unittest.IsolatedAsyncioTestCase):
                     await runtime._queue.join()
                     await asyncio.wait_for(summary_called.wait(), timeout=1)
                     self.assertEqual(summary_calls, ["fixture-group"])
+
+    async def test_reply_from_old_context_epoch_is_not_sent(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="qq-bot-stale-context-test-") as temp_dir:
+            with patch.dict(
+                os.environ,
+                {
+                    "SQLITE_PATH": str(Path(temp_dir) / "bot.db"),
+                    "RAG_ENABLED": "false",
+                    "NATCAPQQ_CALLBACK_TOKEN": "fixture-callback-token",
+                },
+            ):
+                _root_logger.addHandler(_null_handler)
+                try:
+                    app = create_app()
+                finally:
+                    _root_logger.removeHandler(_null_handler)
+
+            service = app.state.service
+            adapter = app.state.adapter
+            event = GroupMessageEvent(
+                message_id="stale-reply",
+                group_id="fixture-group",
+                user_id="fixture-user",
+                nickname="Fixture",
+                text="hello bot",
+                is_at_bot=True,
+                timestamp=1,
+                raw_event={"post_type": "message", "message_type": "group"},
+            )
+
+            with (
+                patch.object(type(adapter), "hydrate_quote", new=AsyncMock(side_effect=lambda value: value)),
+                patch.object(type(adapter), "get_group_bot_names", new=AsyncMock(return_value=())),
+                patch.object(
+                    type(service),
+                    "handle_group_message",
+                    new=AsyncMock(return_value=ChatReply("stale response", context_epoch=4)),
+                ),
+                patch.object(
+                    type(service), "is_context_epoch_current", new=AsyncMock(return_value=False)
+                ) as is_current,
+                patch("app.main.QQMessageDispatcher.send", new=AsyncMock()) as send,
+            ):
+                # Exercise the actual event handler through the runtime-owned callback.
+                runtime = app.state.message_runtime
+                async with app.router.lifespan_context(app):
+                    await runtime._handler(event)
+                    send.assert_not_awaited()
+            is_current.assert_awaited_once_with("fixture-group", 4)
 
 
 if __name__ == "__main__":

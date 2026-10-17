@@ -25,6 +25,7 @@ from app.commands.registry import CommandRegistry
 from app.commands.renderer import QQCommandRenderer
 from app.commands.service import CommandService
 from app.config import Settings
+from app.context.budget import ContextWindowBudget
 from app.knowledge.documents import DocumentIndexStatus, DocumentSource, IndexState
 from app.memory import MemoryStore
 from app.models import GroupMessageEvent
@@ -230,6 +231,19 @@ class CommandServiceTest(unittest.TestCase):
         self.assertIn("A only", admin_a.text)
         self.assertNotIn("A only", admin_b.text)
 
+    def test_enforce_mode_rejects_model_switch_without_explicit_profile(self) -> None:
+        llm = _DummyLLM()
+        llm.context_budget = ContextWindowBudget((), mode="enforce")
+        llm.context_profile_key = "deepseek:test-model"
+        service = self.service(llm)
+
+        reply = _run(
+            service.handle_group_message(_event("/model use deepseek", group="group-a", user="admin"))
+        )
+
+        self.assertIn("Profile", reply.text)
+        self.assertIsNone(self.memory.get_group_setting("group-a", "model_provider"))
+
     def test_help_hides_admin_subcommands_from_members(self) -> None:
         service = self.service()
         member_help = _run(service.handle_group_message(_event("/help", user="member")))
@@ -257,15 +271,88 @@ class CommandServiceTest(unittest.TestCase):
     def test_destructive_confirmation_is_bound_to_user_group_operation_and_single_use(self) -> None:
         service = self.service()
         self.memory.add_message("group-a", "admin", "admin", "user", "keep")
-        requested = _run(service.handle_group_message(_event("/context clear", group="group-a", user="admin")))
+        requested = _run(service.handle_group_message(_event("/context reset", group="group-a", user="admin")))
         token = requested.text.rsplit(" ", 1)[-1]
         wrong_scope = _run(service.handle_group_message(_event(f"/confirm {token}", group="group-b", user="admin")))
         self.assertIn("无效", wrong_scope.text)
         self.assertEqual(len(self.memory.get_recent_messages("group-a")), 1)
         confirmed = _run(service.handle_group_message(_event(f"/confirm {token}", group="group-a", user="admin")))
-        self.assertIn("已清除", confirmed.text)
+        self.assertIn("开启新的上下文 epoch", confirmed.text)
+        self.assertEqual(self.memory.count_group_history("group-a"), 1)
+        self.assertEqual(self.memory.get_recent_messages("group-a"), [])
         replay = _run(service.handle_group_message(_event(f"/confirm {token}", group="group-a", user="admin")))
         self.assertIn("无效", replay.text)
+
+    def test_context_purge_requires_confirmation_and_deletes_in_bounded_batches(self) -> None:
+        service = self.service()
+        for index in range(501):
+            self.memory.add_message("group-a", f"u{index}", "member", "user", f"line {index}")
+        request = _run(service.handle_group_message(_event("/context purge", group="group-a", user="admin")))
+        token = request.text.rsplit(" ", 1)[-1]
+        self.assertEqual(self.memory.count_group_history("group-a"), 501)
+        first = _run(service.handle_group_message(_event(f"/confirm {token}", group="group-a", user="admin")))
+        self.assertIn("尚余 1 条", first.text)
+        self.assertEqual(self.memory.get_recent_messages("group-a"), [])
+        self.assertEqual(self.memory.count_group_history("group-a"), 1)
+        next_request = _run(service.handle_group_message(_event("/context purge", group="group-a", user="admin")))
+        next_token = next_request.text.rsplit(" ", 1)[-1]
+        done = _run(service.handle_group_message(_event(f"/confirm {next_token}", group="group-a", user="admin")))
+        self.assertIn("已隐藏并物理删除", done.text)
+        self.assertEqual(self.memory.count_group_history("group-a"), 0)
+
+    def test_context_stats_and_summary_flag_report_observed_state(self) -> None:
+        service = self.service()
+        self.memory.add_message("group-a", "u", "member", "user", "a question")
+        self.memory.upsert_group_summary("group-a", "stored summary", 1)
+        epoch = self.memory.get_context_epoch("group-a")
+        self.assertTrue(self.memory.record_context_compaction(
+            group_id="group-a", epoch=epoch, archived_tool_blocks=2, dropped_context_items=3
+        ))
+        stats = _run(service.handle_group_message(_event("/context stats", group="group-a", user="member")))
+        show = _run(service.handle_group_message(_event("/context show --summary", group="group-a", user="member")))
+        self.assertIn("当前请求估算：UNKNOWN", stats.text)
+        self.assertIn("归档工具块 2", stats.text)
+        self.assertIn("stored summary", show.text)
+        self.assertIn("不可信历史摘要", show.text)
+        old = _run(service.handle_group_message(_event("/context summary", group="group-a", user="member")))
+        self.assertIn("未知子命令", old.text)
+
+    def test_context_confirmation_is_invalidated_when_epoch_changes(self) -> None:
+        service = self.service()
+        self.memory.add_message("group-a", "u", "member", "user", "preserve this")
+        request = _run(service.handle_group_message(_event("/context reset", group="group-a", user="admin")))
+        token = request.text.rsplit(" ", 1)[-1]
+        self.memory.reset_group_context("group-a")
+        result = _run(service.handle_group_message(_event(f"/confirm {token}", group="group-a", user="admin")))
+        self.assertIn("版本已变化", result.text)
+        self.assertEqual(self.memory.count_group_history("group-a"), 1)
+
+    def test_context_compact_is_admin_only_and_does_not_call_model_when_ineligible(self) -> None:
+        llm = _DummyLLM("must not be called")
+        service = self.service(llm)
+        denied = _run(service.handle_group_message(_event("/context compact", user="member")))
+        self.assertEqual(denied.text, "你没有权限执行此命令。")
+        response = _run(service.handle_group_message(_event("/context compact", user="admin")))
+        self.assertIn("没有达到压缩条件", response.text)
+        self.assertEqual(llm.calls, 0)
+
+    def test_memory_search_is_admin_only_and_group_scoped(self) -> None:
+        service = self.service()
+        self.memory.add_structured_memory(
+            group_id="group-a", owner_user_id=None, content="GTNH blast furnace fact",
+            actor_user_id="admin", verification="admin_confirmed", visibility="group",
+            source_kind="fixture", source_id="source-a",
+        )
+        self.memory.add_structured_memory(
+            group_id="group-b", owner_user_id=None, content="GTNH hidden other group",
+            actor_user_id="admin", verification="admin_confirmed", visibility="group",
+            source_kind="fixture", source_id="source-b",
+        )
+        denied = _run(service.handle_group_message(_event("/memory search GTNH", group="group-a", user="member")))
+        visible = _run(service.handle_group_message(_event("/memory search GTNH --kind fact", group="group-a", user="admin")))
+        self.assertEqual(denied.text, "你没有权限执行此命令。")
+        self.assertIn("blast furnace", visible.text)
+        self.assertNotIn("hidden other group", visible.text)
 
     def test_expired_confirmation_is_rejected(self) -> None:
         service = self.service()

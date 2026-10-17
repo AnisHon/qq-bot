@@ -22,6 +22,7 @@ from app.commands.contracts import (
 )
 from app.commands.registry import CommandRegistry
 from app.commands.renderer import QQCommandRenderer
+from app.context.memories import MemoryService
 from app.knowledge.documents import DocumentFilter, IndexState
 from app.recipes.models import DatasetAvailability, PackVersionKey
 from app.recipes.query import (
@@ -65,6 +66,7 @@ class CommandService:
     def __init__(self, settings, memory, llm_handler, storage_executor=None) -> None:
         self.settings = settings
         self.memory = memory
+        self.memory_service = MemoryService(memory)
         self.llm_handler = llm_handler
         self.storage_executor = storage_executor
         self.registry = CommandRegistry()
@@ -110,11 +112,16 @@ class CommandService:
         register(CommandSpec(("model", "use"), "切换本群模型", "/model use <model>", self._model_use,
                              (ArgumentSpec("model", max_length=128),), policy=admin))
 
-        root("context", "查看、清理或查看摘要")
-        register(CommandSpec(("context", "show"), "查看本群上下文状态", "/context show", self._context_show))
-        register(CommandSpec(("context", "summary"), "查看已有自动摘要", "/context summary", self._context_summary))
-        register(CommandSpec(("context", "clear"), "清除本群上下文和摘要", "/context clear", self._context_clear,
-                             policy=admin))
+        root("context", "查看本群上下文状态或管理上下文")
+        register(CommandSpec(("context", "show"), "查看本群上下文状态，可附带摘要", "/context show [--summary]",
+                             self._context_show, ( ), (OptionSpec("summary", flag=True),)))
+        register(CommandSpec(("context", "stats"), "查看本群上下文索引和预算估算", "/context stats", self._context_stats))
+        register(CommandSpec(("context", "compact"), "按当前安全策略尝试更新摘要", "/context compact",
+                             self._context_compact, policy=admin, timeout_seconds=120))
+        register(CommandSpec(("context", "reset"), "开启新上下文 epoch 并保留原始历史", "/context reset",
+                             self._context_reset, policy=admin))
+        register(CommandSpec(("context", "purge"), "删除本群保留的聊天历史", "/context purge",
+                             self._context_purge, policy=admin))
 
         root("memory", "管理本群长期记忆")
         register(CommandSpec(("memory", "list"), "查看本群长期记忆", "/memory list", self._memory_list, policy=admin))
@@ -123,6 +130,11 @@ class CommandService:
                              allow_multiline=True))
         register(CommandSpec(("memory", "delete"), "按编号删除一条记忆", "/memory delete <id>", self._memory_delete,
                              (ArgumentSpec("id", value_type="int"),), policy=admin))
+        register(CommandSpec(("memory", "search"), "按权限检索本群长期事实或事件记忆",
+                             "/memory search <query> [--kind fact|episode|all] [--limit <n>]",
+                             self._memory_search, (ArgumentSpec("query", variadic=True, max_length=512),),
+                             (OptionSpec("kind", choices=("fact", "episode", "all")),
+                              OptionSpec("limit", value_type="int")), policy=admin))
         register(CommandSpec(("memory", "clear"), "清除本群全部长期记忆", "/memory clear", self._memory_clear,
                              policy=admin))
 
@@ -261,7 +273,12 @@ class CommandService:
         if not providers:
             return CommandResult(CommandErrorKind.NOT_CONFIGURED, "当前没有已配置模型。")
         lines = ["可用模型："]
-        lines.extend(f"- {name}: {client.model}{'（当前）' if name == current else ''}" for name, client in providers.items())
+        lines.extend(
+            f"- {name}: {client.model}"
+            f"{'（当前）' if name == current else ''}"
+            f"{'（context profile 未配置，enforce 下不可切换）' if not self.llm_handler.model_selection_has_context_profile(name) else ''}"
+            for name, client in providers.items()
+        )
         return CommandResult.success("\n".join(lines))
 
     async def _model_use(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
@@ -270,26 +287,69 @@ class CommandService:
         if client is None:
             available = "、".join(self.llm_handler._available_llms()) or "无"
             raise CommandError(CommandErrorKind.NOT_FOUND, f"模型 {model} 不可用。当前可用：{available}")
+        if not self.llm_handler.model_selection_has_context_profile(model):
+            raise CommandError(
+                CommandErrorKind.NOT_CONFIGURED,
+                f"模型 {model} 没有显式 context window Profile；管理员配置后才能在 enforce 模式下切换。",
+            )
         await self._db(context, self.memory.set_group_setting, context.group_id, "model_provider", model)
         return CommandResult.success(f"本群已切换到 {model}（{client.model}）。")
 
-    async def _context_show(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
-        count, summary = await asyncio.gather(
-            self._db(context, self.memory.count_group_history, context.group_id),
+    async def _context_show(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
+        stats, summary = await asyncio.gather(
+            self._db(context, self.memory.get_context_stats, context.group_id),
             self._db(context, self.memory.get_group_summary, context.group_id),
         )
+        count = int(stats["history_messages"])
+        detail = f"本群上下文：{count} 条聊天记录；自动摘要{'已生成' if summary else '尚无'}。"
+        if command.options.get("summary"):
+            if not summary:
+                return CommandResult(CommandErrorKind.NOT_FOUND, detail + "\n当前没有可展示的摘要。")
+            summary_text = str(summary.get("summary") or "")
+            if len(summary_text) > 4500:
+                summary_text = summary_text[:4500].rstrip() + "……（摘要过长，已截断）"
+            detail += "\n当前群摘要（不可信历史摘要，仅供参考）：\n" + summary_text
         return CommandResult.success(
-            f"本群上下文：{count} 条聊天记录；自动摘要{'已生成' if summary else '尚无'}。"
+            detail
         )
 
-    async def _context_summary(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
-        summary = await self._db(context, self.memory.get_group_summary, context.group_id)
-        if not summary:
-            return CommandResult(CommandErrorKind.NOT_FOUND, "当前没有自动摘要。")
-        return CommandResult.success(f"本群自动摘要：\n{summary['summary']}")
+    async def _context_stats(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
+        stats = await self._db(context, self.memory.get_context_stats, context.group_id)
+        provider = await self.llm_handler._current_model_provider(context.group_id)
+        client = self.llm_handler._available_llms().get(provider)
+        budget = getattr(client, "context_budget", None) if client is not None else None
+        profile_key = getattr(client, "context_profile_key", None) if client is not None else None
+        profile = budget.get_profile(profile_key) if budget is not None else None
+        window = f"{profile.context_window_tokens}（{profile.status}）" if profile is not None else "UNKNOWN"
+        mode = budget.mode if budget is not None else "UNKNOWN"
+        return CommandResult.success(
+            "本群上下文统计（仅 SQLite 可观察值；estimated token 不是 tokenizer 精确值）：\n"
+            f"epoch：{stats['epoch']}；活动历史：{stats['history_messages']} 条 / {stats['history_bytes']} 字节\n"
+            f"历史 token 估算：{stats['history_estimated_tokens']}；FTS 行：{stats['history_fts_rows']}\n"
+            f"摘要：{'有' if stats['summary_available'] else '无'}；revision：{stats['summary_revision']}；"
+            f"覆盖到行：{stats['summary_covered_id']}\n"
+            f"事件记忆：{stats['active_episodes']}；已验证长期事实：{stats['verified_facts']}\n"
+            f"Compaction：{stats['compaction_count']} 次；归档工具块 {stats['archived_tool_blocks']}；"
+            f"移除可选上下文项 {stats['dropped_context_items']}\n"
+            f"上下文模式：{mode}；模型窗口：{window}；当前请求估算：UNKNOWN（本命令不读取或重建上一请求payload）\n"
+            f"向量待处理：{stats['pending_vector_operations']}；purge：{stats['purge_status']}"
+        )
 
-    async def _context_clear(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
-        return self._request_confirmation(context, "context.clear", f"group:{context.group_id}")
+    async def _context_compact(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
+        message = await self.llm_handler.maybe_update_group_summary(context.group_id)
+        return CommandResult.success(message)
+
+    async def _context_reset(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
+        epoch = await self._db(context, self.memory.get_context_epoch, context.group_id)
+        return self._request_confirmation(
+            context, "context.reset", f"group:{context.group_id}:epoch:{epoch}"
+        )
+
+    async def _context_purge(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
+        epoch = await self._db(context, self.memory.get_context_epoch, context.group_id)
+        return self._request_confirmation(
+            context, "context.purge", f"group:{context.group_id}:epoch:{epoch}"
+        )
 
     async def _memory_list(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
         display_limit = max(1, min(100, int(self.settings.memory_query_limit)))
@@ -304,6 +364,49 @@ class CommandService:
             lines.append(f"已截断：当前显示前 {display_limit} 条。")
         return CommandResult.success("\n".join(lines))
 
+    async def _memory_search(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
+        query = str(command.arguments.get("query") or "").strip()
+        kind = str(command.options.get("kind") or "all")
+        limit = int(command.options.get("limit") or 10)
+        if not 1 <= limit <= 20:
+            raise CommandError(CommandErrorKind.INVALID_ARGUMENT, "--limit 范围为 1 到 20。")
+        rows: list[dict[str, object]] = []
+        if kind in {"fact", "all"}:
+            facts = await self._db(
+                context, self.memory_service.search,
+                query, group_id=context.group_id, user_id=context.user_id, limit=limit,
+            )
+            rows.extend({"kind": "fact", **row} for row in facts)
+        if kind in {"episode", "all"}:
+            episodes = await self._db(
+                context, self.memory_service.search_episodes,
+                query, group_id=context.group_id,
+                epoch=await self._db(context, self.memory.get_context_epoch, context.group_id),
+                limit=limit,
+            )
+            rows.extend({"kind": "episode", **row} for row in episodes)
+        rows = rows[:limit]
+        if not rows:
+            return CommandResult(CommandErrorKind.NOT_FOUND, "当前授权范围内没有匹配的记忆。")
+        lines = [f"本群匹配记忆（当前成员私有事实仅限本人；最多显示 {limit} 条）："]
+        for row in rows:
+            content = str(row.get("content") or row.get("summary") or "")
+            if len(content) > 700:
+                content = content[:700].rstrip() + "……"
+            verify = str(row.get("verification") or "derived_summary")
+            sources = row.get("source_refs_json")
+            lines.append(f"#{row.get('id', '?')} [{row.get('kind')}; {verify}] {content}")
+            if sources:
+                lines.append(f"  来源：{str(sources)[:500]}")
+            for source in row.get("sources", ()) if isinstance(row.get("sources"), list) else ():
+                if isinstance(source, dict):
+                    lines.append(
+                        f"  证据：{source.get('source_kind', 'unknown')} / "
+                        f"{source.get('source_ref') or source.get('locator') or '未记录'} "
+                        f"[{source.get('source_state', 'unknown')}]"
+                    )
+        return CommandResult.success("\n".join(lines))
+
     async def _memory_add(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
         content = str(command.arguments.get("content", "")).strip()
         entries = [line.strip() for line in content.splitlines() if line.strip()]
@@ -314,7 +417,11 @@ class CommandService:
         ids = []
         for entry in entries:
             clean = _clean_memory_text(entry)
-            ids.append(await self._db(context, self.memory.add_memory, "group", context.group_id, clean, context.user_id))
+            ids.append(await self._db(
+                context, self.memory_service.add_admin_fact,
+                group_id=context.group_id, actor_user_id=context.user_id, content=clean,
+                source_message_id=context.event.message_id,
+            ))
         return CommandResult.success("已添加本群长期记忆：" + "、".join(f"#{item}" for item in ids))
 
     async def _memory_delete(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
@@ -634,9 +741,30 @@ class CommandService:
         del self._pending_confirmations[token_hash]
         if not context.is_admin:
             raise CommandError(CommandErrorKind.PERMISSION_DENIED, "你没有权限执行此确认操作。")
-        if pending.operation == "context.clear" and pending.target == f"group:{context.group_id}":
-            count = await self._db(context, self.memory.clear_group_context, context.group_id)
-            return CommandResult.success(f"已清除本群上下文和自动摘要，共 {count} 条聊天记录。")
+        target_prefix = f"group:{context.group_id}:epoch:"
+        if pending.operation in {"context.reset", "context.purge"} and pending.target.startswith(target_prefix):
+            try:
+                requested_epoch = int(pending.target[len(target_prefix):])
+            except ValueError:
+                raise CommandError(CommandErrorKind.NOT_FOUND, "确认操作已失效，请重新发起命令。") from None
+            current_epoch = await self._db(context, self.memory.get_context_epoch, context.group_id)
+            if current_epoch != requested_epoch:
+                raise CommandError(CommandErrorKind.NOT_FOUND, "群上下文版本已变化；请重新发起命令并确认新版本。")
+            if pending.operation == "context.reset":
+                retained = await self._db(context, self.memory.reset_group_context, context.group_id)
+                return CommandResult.success(
+                    f"已开启新的上下文 epoch；旧 epoch 的 {retained} 条原始历史保留，但不会参与新会话检索。"
+                )
+            hidden = await self._db(context, self.memory.begin_group_history_purge, context.group_id)
+            batch = await self._db(context, self.memory.purge_group_history_batch, context.group_id, 500)
+            if batch["complete"]:
+                return CommandResult.success(
+                    f"本群历史已隐藏并物理删除 {batch['deleted']} 条；人工长期事实保留，失效来源已标记。"
+                )
+            return CommandResult.success(
+                f"本群 {hidden} 条历史已隐藏并从检索中隔离；本批删除 {batch['deleted']} 条，"
+                f"尚余 {batch['remaining']} 条。再次执行 /context purge 并确认可继续分批删除。人工长期事实保留。"
+            )
         if pending.operation == "memory.clear" and pending.target == f"group:{context.group_id}":
             count = await self._db(context, self.memory.delete_memories_by_keyword,
                                    "", scope="group", scope_id=context.group_id)
@@ -657,7 +785,11 @@ class CommandService:
             target=target,
             expires_at=time.monotonic() + CONFIRMATION_TTL_SECONDS,
         )
-        title = "清除本群上下文和自动摘要" if operation == "context.clear" else "清除本群全部长期记忆"
+        title = {
+            "context.reset": "开启新上下文 epoch（保留原始历史）",
+            "context.purge": "物理删除本群聊天历史和派生索引（人工长期事实保留）",
+            "memory.clear": "清除本群全部长期记忆",
+        }.get(operation, "执行本群操作")
         return CommandResult.success(
             f"请确认：{title}。此令牌 5 分钟内有效且仅限当前用户和群使用。\n/confirm {raw_token}"
         )
