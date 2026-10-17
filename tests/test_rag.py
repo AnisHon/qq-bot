@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -261,7 +262,7 @@ class RagStoreTest(unittest.TestCase):
             self.assertEqual(store.delete_document("sfm"), 0)
             self.assertEqual(store.search("chest", document_name="sfm"), [])
             self.assertEqual(len(store.search("furnace", document_name="other")), 1)
-            with sqlite3.connect(store.sqlite_path) as conn:
+            with closing(sqlite3.connect(store.sqlite_path)) as conn:
                 self.assertEqual(
                     conn.execute("SELECT COUNT(*) FROM rag_documents WHERE name = 'sfm'").fetchone()[0],
                     0,
