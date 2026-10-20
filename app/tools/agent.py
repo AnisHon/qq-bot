@@ -33,6 +33,11 @@ from app.context.compaction import AgentContextCompactor, EvidenceStore, Protoco
 from app.progress.events import (
     AgentEventKind, AgentEventPayload, EventSink, TaskIdentity, ToolCategory, ToolOutcome,
 )
+from app.progress.commentary import (
+    PUBLIC_COMMENTARY_TOOL,
+    commentary_delivery_available,
+    public_commentary_spec,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -462,6 +467,7 @@ def _task_evidence_read_spec() -> ToolSpec:
 def _build_legacy_registry() -> ToolRegistry:
     registry = ToolRegistry(build_legacy_tool_specs(_LEGACY_TOOL_DEFINITIONS))
     registry.register(_task_evidence_read_spec())
+    registry.register(public_commentary_spec())
     registry.freeze()
     return registry
 
@@ -470,6 +476,42 @@ TOOL_REGISTRY = _build_legacy_registry()
 # Compatibility facade: this value is now generated from registered specs.
 TOOL_DEFINITIONS = TOOL_REGISTRY.openai_schemas()
 TOOL_NAMES = TOOL_REGISTRY.names()
+
+
+def agent_tool_names(
+    policy_snapshot: PolicySnapshot | None,
+    *,
+    group_id: str = "",
+    user_id: str = "",
+    task_identity: TaskIdentity | None = None,
+    event_sink: EventSink | None = None,
+) -> frozenset[str]:
+    names = TOOL_REGISTRY.names(
+        policy_snapshot, group_id=group_id, user_id=user_id, include_internal=True,
+    )
+    if not commentary_delivery_available(event_sink, task_identity):
+        names = names - {PUBLIC_COMMENTARY_TOOL}
+    return names
+
+
+def agent_tool_schemas(
+    policy_snapshot: PolicySnapshot | None,
+    *,
+    group_id: str = "",
+    user_id: str = "",
+    task_identity: TaskIdentity | None = None,
+    event_sink: EventSink | None = None,
+) -> list[dict[str, Any]]:
+    names = agent_tool_names(
+        policy_snapshot,
+        group_id=group_id,
+        user_id=user_id,
+        task_identity=task_identity,
+        event_sink=event_sink,
+    )
+    return TOOL_REGISTRY.openai_schemas(
+        policy_snapshot, group_id=group_id, user_id=user_id, enabled_names=names,
+    )
 
 
 async def _safe_chat(client: Any, messages: list[dict[str, Any]], **kwargs: Any) -> str:
@@ -530,6 +572,7 @@ async def run_agent_loop(
     last_text: str = ""
     seen_calls: set[tuple[str, str]] = set()
     executed_calls = 0
+    verified_tool_outcomes: dict[str, str] = {}
     references: list[tuple[int, str, str]] = []
     loop = asyncio.get_running_loop()
     deadline = deadline if deadline is not None else loop.time() + total_timeout
@@ -622,10 +665,12 @@ async def run_agent_loop(
             revision=working_state.checkpoint_revision,
         ))
 
-    allowed_names = TOOL_REGISTRY.names(
+    allowed_names = agent_tool_names(
         policy_snapshot,
         group_id=budget_scope.group_id or "" if budget_scope is not None else "",
         user_id=budget_scope.user_id or "" if budget_scope is not None else "",
+        task_identity=task_identity,
+        event_sink=event_sink,
     )
 
     if working_state is not None and working_memory is not None:
@@ -645,10 +690,12 @@ async def run_agent_loop(
             break
         if context_guard is not None and not await context_guard():
             raise ContextEpochChanged("context epoch changed before Agent model dispatch")
-        schemas = TOOL_REGISTRY.openai_schemas(
+        schemas = agent_tool_schemas(
             policy_snapshot,
             group_id=budget_scope.group_id or "" if budget_scope is not None else "",
             user_id=budget_scope.user_id or "" if budget_scope is not None else "",
+            task_identity=task_identity,
+            event_sink=event_sink,
         )
         model_started = False
         model_completed = False
@@ -733,10 +780,13 @@ async def run_agent_loop(
         # ── Execute all requested tools (concurrently) ───────────────────
         valid_calls = []
         skipped: dict[str, str] = {}
+        commentary_seen_this_round = False
         for tc in response.tool_calls:
             signature = _tool_signature(tc)
             if tc.name not in allowed_names:
                 skipped[tc.id] = f"未知工具：{tc.name}。"
+            elif tc.name == PUBLIC_COMMENTARY_TOOL and commentary_seen_this_round:
+                skipped[tc.id] = "本轮公开说明数量已达到上限，请继续执行实际任务。"
             elif signature in seen_calls:
                 skipped[tc.id] = "该工具调用与之前重复，已跳过。请使用已有结果。"
             elif len(valid_calls) >= max_calls_per_round:
@@ -746,6 +796,8 @@ async def run_agent_loop(
             else:
                 seen_calls.add(signature)
                 valid_calls.append(tc)
+                if tc.name == PUBLIC_COMMENTARY_TOOL:
+                    commentary_seen_this_round = True
         for tc in response.tool_calls:
             if tc.id not in skipped:
                 continue
@@ -780,6 +832,33 @@ async def run_agent_loop(
             if generation_call is not None
             else max(400, results_max_chars // max(len(valid_calls), 1))
         )
+        commentary_calls = [call for call in valid_calls if call.name == PUBLIC_COMMENTARY_TOOL]
+        business_calls = [call for call in valid_calls if call.name != PUBLIC_COMMENTARY_TOOL]
+        tool_results_by_id: dict[str, ToolResult | BaseException] = {}
+        # Publish the public plan before starting same-round work. This preserves
+        # the model's tool_call protocol order later while keeping actual domain
+        # tools concurrent with one another.
+        for call in commentary_calls:
+            try:
+                tool_results_by_id[call.id] = await _dispatch_registered_tool_call(
+                    llm, call, deadline=deadline, tool_timeout=tool_timeout,
+                    result_max_chars=per_result_chars, policy_snapshot=policy_snapshot,
+                    local_knowledge_search=local_knowledge_search,
+                    tool_extensions=runtime_tool_extensions, context_epoch=context_epoch,
+                    request_id=request_id, task_identity=task_identity, event_sink=event_sink,
+                    round_index=_round + 1, tool_call_id=call.id,
+                    verified_tool_outcomes=verified_tool_outcomes,
+                )
+            except asyncio.CancelledError:
+                if working_state is not None and working_memory is not None and working_state.status == "running":
+                    try:
+                        await asyncio.shield(save_working_state(status="cancelled"))
+                    except Exception:  # noqa: BLE001
+                        LOGGER.warning("could not persist cancellation checkpoint")
+                raise
+            except Exception as exc:  # noqa: BLE001 - a commentary failure must not block work
+                tool_results_by_id[call.id] = exc
+
         tool_tasks = [
             asyncio.create_task(
                 _dispatch_registered_tool_call(
@@ -797,11 +876,13 @@ async def run_agent_loop(
                     event_sink=event_sink,
                     round_index=_round + 1,
                     tool_call_id=tc.id,
+                    verified_tool_outcomes=verified_tool_outcomes,
                 ),
                 name=f"agent-tool-{index}",
             )
-            for index, tc in enumerate(valid_calls)
+            for index, tc in enumerate(business_calls)
         ]
+        business_results = []
         try:
             if tool_tasks:
                 remaining = deadline - loop.time()
@@ -810,11 +891,12 @@ async def run_agent_loop(
                 _done, pending = await asyncio.wait(tool_tasks, timeout=remaining)
                 if pending:
                     raise TimeoutError("Agent deadline expired while tools were running")
-                results = await asyncio.gather(*tool_tasks, return_exceptions=True)
-                if any(isinstance(result, TimeoutError) for result in results):
+                business_results = await asyncio.gather(*tool_tasks, return_exceptions=True)
+                if any(isinstance(result, TimeoutError) for result in business_results):
                     raise TimeoutError("Agent deadline expired while tools were running")
-            else:
-                results = []
+                tool_results_by_id.update(
+                    (call.id, result) for call, result in zip(business_calls, business_results)
+                )
         except (asyncio.CancelledError, TimeoutError):
             for task in tool_tasks:
                 if not task.done():
@@ -834,6 +916,13 @@ async def run_agent_loop(
         evidence_by_call: dict[str, tuple[str, ...]] = {}
         evidence_metadata: list[dict[str, Any]] = []
         result_statuses: dict[str, str] = {}
+        results = [
+            tool_results_by_id.get(
+                call.id,
+                ToolResult(ToolStatus.ERROR, "Tool result unavailable."),
+            )
+            for call in valid_calls
+        ]
         for tc, result in zip(valid_calls, results):
             if isinstance(result, BaseException):
                 content = f"工具 {tc.name} 执行失败。"
@@ -842,6 +931,9 @@ async def run_agent_loop(
             else:
                 content = _format_tool_observation(result, per_result_chars)
                 result_statuses[tc.id] = result.status.value
+                spec = TOOL_REGISTRY.get(tc.name)
+                if spec is not None and spec.progress_category != ToolCategory.COMMENTARY:
+                    verified_tool_outcomes[tc.id] = result.status.value
                 result_refs = evidence_store.add_result(
                     result,
                     request_id=request_id,
@@ -914,11 +1006,15 @@ async def run_agent_loop(
             step_updates = tuple(
                 f"{tc.name}: {result_statuses.get(tc.id, 'unknown')}"
                 for tc in response.tool_calls
+                if (TOOL_REGISTRY.get(tc.name) is None or
+                    TOOL_REGISTRY.get(tc.name).progress_category != ToolCategory.COMMENTARY)
             )
             failures = tuple(
                 f"{tc.name}: {result_statuses.get(tc.id, 'unknown')}"
                 for tc in response.tool_calls
                 if result_statuses.get(tc.id) not in {"ok", "no_results"}
+                and (TOOL_REGISTRY.get(tc.name) is None or
+                     TOOL_REGISTRY.get(tc.name).progress_category != ToolCategory.COMMENTARY)
             )
             await save_working_state(
                 completed_steps=tuple((*working_state.completed_steps, *step_updates)[-32:]),
@@ -1008,6 +1104,7 @@ async def _dispatch_registered_tool_call(
     event_sink: EventSink | None = None,
     round_index: int | None = None,
     tool_call_id: str | None = None,
+    verified_tool_outcomes: Mapping[str, str] | None = None,
 ) -> ToolResult:
     budget_scope = current_budget_scope()
     tool_request_id = budget_scope.request_id if budget_scope is not None else f"agent-{call.id}"
@@ -1032,6 +1129,7 @@ async def _dispatch_registered_tool_call(
             "local_knowledge_search": local_knowledge_search,
             **(dict(tool_extensions) if tool_extensions is not None else {}),
             "agent_evidence_request_id": request_id,
+            "agent_tool_outcomes": dict(verified_tool_outcomes or {}),
         },
     )
     return await TOOL_REGISTRY.dispatch(call.name, call.arguments, context)

@@ -12,7 +12,9 @@ from app.progress.events import (
     AgentEvent,
     AgentEventKind,
     AgentEventPayload,
+    CommentaryKind,
     ExecutionStatus,
+    PublicCommentary,
     RequestAgentEventSink,
     TaskIdentity,
     ToolCategory,
@@ -79,6 +81,7 @@ class ProgressCandidate:
     created_monotonic: float
     expires_monotonic: float
     notice_number: int
+    commentary: PublicCommentary | None = None
 
 
 class BoundedProgressMailbox:
@@ -170,6 +173,10 @@ class _TaskState:
     working_state_status: WorkingStateStatus = WorkingStateStatus.UNKNOWN
     checkpoint_revision: int | None = None
     final_delivery_status: str | None = None
+    pending_commentaries: list[PublicCommentary] = field(default_factory=list)
+    commentary_fingerprints: set[str] = field(default_factory=set)
+    commentary_count: int = 0
+    has_public_plan: bool = False
 
     @property
     def active(self) -> bool:
@@ -215,7 +222,11 @@ class ProgressCoordinator:
         self._tasks[identity.task_id] = _TaskState(identity, selected_mode, self.clock.monotonic())
         self._tasks.move_to_end(identity.task_id)
         self._wake.set()
-        return RequestAgentEventSink(identity, self.publish)
+        return RequestAgentEventSink(
+            identity,
+            self.publish,
+            public_commentary_enabled=selected_mode != ProgressMode.QUIET,
+        )
 
     def publish(self, event: AgentEvent) -> bool:
         state = self._tasks.get(event.identity.task_id)
@@ -240,7 +251,14 @@ class ProgressCoordinator:
             if event.kind not in _TERMINAL_KINDS:
                 return False
 
-        self._reduce(state, event)
+        if event.kind == AgentEventKind.PUBLIC_COMMENTARY:
+            if not self._accept_commentary(state, event.commentary):
+                self.metrics["commentary_rejected"] += 1
+                self._wake.set()
+                return False
+            self.metrics["commentary_accepted"] += 1
+        else:
+            self._reduce(state, event)
         if event.kind in _TERMINAL_KINDS:
             status = event.payload.execution_status or {
                 AgentEventKind.TASK_COMPLETED: ExecutionStatus.COMPLETED,
@@ -253,6 +271,43 @@ class ProgressCoordinator:
         else:
             self._maybe_offer(state, now=self.clock.monotonic())
         self._wake.set()
+        return True
+
+    def _accept_commentary(
+        self, state: _TaskState, commentary: PublicCommentary | None,
+    ) -> bool:
+        if commentary is None or commentary.task_id != state.identity.task_id:
+            return False
+        if state.commentary_count >= 3 or commentary.fingerprint in state.commentary_fingerprints:
+            return False
+        if commentary.kind == CommentaryKind.PLAN:
+            if state.has_public_plan or commentary.related_tool_call_ids or commentary.round_index != 1:
+                return False
+            state.has_public_plan = True
+        else:
+            if not commentary.related_tool_call_ids:
+                return False
+            referenced = [state.tools.get(call_id) for call_id in commentary.related_tool_call_ids]
+            if any(item is None or item.active or item.outcome is None for item in referenced):
+                return False
+            outcomes = {item.outcome for item in referenced if item is not None}
+            allowed = {
+                CommentaryKind.UPDATE: {ToolOutcome.SUCCESS, ToolOutcome.PARTIAL},
+                CommentaryKind.REVISION: {
+                    ToolOutcome.PARTIAL, ToolOutcome.NO_RESULTS, ToolOutcome.UNAVAILABLE,
+                    ToolOutcome.DENIED, ToolOutcome.TIMEOUT, ToolOutcome.ERROR,
+                    ToolOutcome.CANCELLED,
+                },
+                CommentaryKind.BLOCKED: {
+                    ToolOutcome.UNAVAILABLE, ToolOutcome.DENIED, ToolOutcome.TIMEOUT,
+                    ToolOutcome.ERROR,
+                },
+            }[commentary.kind]
+            if not outcomes.intersection(allowed):
+                return False
+        state.commentary_count += 1
+        state.commentary_fingerprints.add(commentary.fingerprint)
+        state.pending_commentaries.append(commentary)
         return True
 
     def _reduce(self, state: _TaskState, event: AgentEvent) -> None:
@@ -275,6 +330,8 @@ class ProgressCoordinator:
             AgentEventKind.TOOL_CANCELLED,
             AgentEventKind.TOOL_REJECTED,
         }:
+            if payload.category == ToolCategory.COMMENTARY:
+                return
             call_id = event.tool_call_id or f"unkeyed:{event.sequence}"
             category = payload.category or ToolCategory.OTHER
             tool = state.tools.setdefault(call_id, _ToolState(call_id, category))
@@ -309,7 +366,9 @@ class ProgressCoordinator:
         if state.notice_count >= MAX_INTERMEDIATE_NOTICES_PER_TASK:
             return
         projection = self._projection(state)
-        if projection == state.last_projection:
+        commentary = state.pending_commentaries[0] if state.pending_commentaries else None
+        candidate_projection = (*projection, commentary.fingerprint if commentary else None)
+        if candidate_projection == state.last_projection:
             return
         if state.last_notice is not None and now - state.last_notice < MIN_NOTICE_INTERVAL_SECONDS:
             state.next_notice_at = state.last_notice + MIN_NOTICE_INTERVAL_SECONDS
@@ -325,11 +384,14 @@ class ProgressCoordinator:
             created_monotonic=now,
             expires_monotonic=now + NOTICE_TTL_SECONDS,
             notice_number=state.notice_count + 1,
+            commentary=commentary,
         )
         if self.mailbox.offer(candidate):
+            if commentary is not None:
+                state.pending_commentaries.pop(0)
             state.notice_count += 1
             state.last_notice = now
-            state.last_projection = projection
+            state.last_projection = candidate_projection
             state.next_notice_at = None
             self.metrics["candidates_offered"] += 1
 

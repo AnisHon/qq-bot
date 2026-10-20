@@ -185,9 +185,14 @@ class ToolRegistry:
         *,
         group_id: str = "",
         user_id: str = "",
+        include_internal: bool = False,
     ) -> frozenset[str]:
+        visible_specs = {
+            name: spec for name, spec in self._specs.items()
+            if include_internal or spec.expose_by_default
+        }
         if policy_snapshot is None:
-            return frozenset(self._specs)
+            return frozenset(visible_specs)
         context = ToolContext(
             request_id="",
             group_id=group_id,
@@ -195,7 +200,7 @@ class ToolRegistry:
             policy_snapshot=policy_snapshot,
         )
         return frozenset(
-            name for name, spec in self._specs.items()
+            name for name, spec in visible_specs.items()
             if spec.policy.denial_reason(name, context) is None
         )
 
@@ -205,8 +210,14 @@ class ToolRegistry:
         *,
         group_id: str = "",
         user_id: str = "",
+        enabled_names: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
-        allowed = self.names(policy_snapshot, group_id=group_id, user_id=user_id)
+        allowed = self.names(
+            policy_snapshot, group_id=group_id, user_id=user_id,
+            include_internal=enabled_names is not None,
+        )
+        if enabled_names is not None:
+            allowed = allowed.intersection(str(name) for name in enabled_names)
         return [
             {
                 "type": "function",

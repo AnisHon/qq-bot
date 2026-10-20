@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 import json
+import re
 import uuid
 from typing import Any, Callable, Protocol
 
@@ -28,6 +29,7 @@ class AgentEventKind(StrEnum):
     COMPACTION_STARTED = "compaction_started"
     COMPACTION_COMPLETED = "compaction_completed"
     CHECKPOINT_SAVED = "checkpoint_saved"
+    PUBLIC_COMMENTARY = "public_commentary"
     WORKING_STATE_NOT_CONFIGURED = "working_state_not_configured"
     WORKING_STATE_SAVE_FAILED = "working_state_save_failed"
     TASK_COMPLETED = "task_completed"
@@ -60,7 +62,68 @@ class ToolCategory(StrEnum):
     REPOSITORY = "repository"
     SFM_VALIDATION = "sfm_validation"
     WEATHER = "weather"
+    COMMENTARY = "commentary"
     OTHER = "other"
+
+
+class CommentaryKind(StrEnum):
+    PLAN = "plan"
+    UPDATE = "update"
+    REVISION = "revision"
+    BLOCKED = "blocked"
+
+
+MAX_PUBLIC_COMMENTARY_CHARS = 240
+MAX_COMMENTARY_TOOL_REFS = 6
+_SENSITIVE_COMMENTARY_RE = re.compile(
+    r"(?:https?://|www\.|\bbearer\s+\S+|(?:api[_ -]?key|access[_ -]?token|password|secret)\s*[:=]|"
+    r"\b(?:sk|tvly|ghp|github_pat|xox[baprs]|AIza)[-_A-Za-z0-9]{12,})",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PublicCommentary:
+    """Validated public task narration, separate from execution facts."""
+
+    kind: CommentaryKind
+    text: str
+    task_id: str
+    round_index: int
+    related_tool_call_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, CommentaryKind):
+            raise ValueError("invalid public commentary kind")
+        if not isinstance(self.text, str):
+            raise ValueError("commentary text must be a string")
+        if not isinstance(self.task_id, str) or not self.task_id or len(self.task_id) > MAX_ID_CHARS:
+            raise ValueError("commentary task id is invalid")
+        if isinstance(self.round_index, bool) or self.round_index < 1:
+            raise ValueError("commentary round index must be positive")
+        if not isinstance(self.related_tool_call_ids, tuple):
+            raise ValueError("commentary tool references must be a tuple")
+        if len(self.related_tool_call_ids) > MAX_COMMENTARY_TOOL_REFS:
+            raise ValueError("too many commentary tool references")
+        if any(not isinstance(item, str) or not item or len(item) > MAX_ID_CHARS
+               for item in self.related_tool_call_ids):
+            raise ValueError("invalid commentary tool reference")
+        if len(set(self.related_tool_call_ids)) != len(self.related_tool_call_ids):
+            raise ValueError("duplicate commentary tool reference")
+        # Drop control characters and collapse whitespace before checking and publishing.
+        normalized = re.sub(r"[\x00-\x1f\x7f]+", " ", self.text)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if not normalized or len(normalized) > MAX_PUBLIC_COMMENTARY_CHARS:
+            raise ValueError("commentary text is empty or exceeds the allowed length")
+        if _SENSITIVE_COMMENTARY_RE.search(normalized) or re.search(r"\bQQ\s*\d{5,}\b", normalized, re.IGNORECASE):
+            raise ValueError("commentary contains a disallowed secret or private identifier")
+        # CQ-looking markup is rendered as plain text and cannot become a QQ segment.
+        normalized = normalized.replace("[CQ:", "［CQ:").replace("[cq:", "［cq:")
+        object.__setattr__(self, "text", normalized)
+
+    @property
+    def fingerprint(self) -> str:
+        return f"{self.kind.value}:{self.text.casefold()}"
 
 
 class ExecutionStatus(StrEnum):
@@ -156,6 +219,7 @@ class AgentEvent:
     round_index: int | None = None
     tool_call_id: str | None = None
     payload: AgentEventPayload = AgentEventPayload()
+    commentary: PublicCommentary | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != 1:
@@ -168,8 +232,18 @@ class AgentEvent:
             raise ValueError("round index must be positive")
         if self.tool_call_id is not None and len(self.tool_call_id) > MAX_ID_CHARS:
             raise ValueError("tool_call_id exceeds the allowed length")
+        if self.kind == AgentEventKind.PUBLIC_COMMENTARY:
+            if self.commentary is None or self.commentary.task_id != self.identity.task_id:
+                raise ValueError("public commentary must match the event task identity")
+            if self.round_index != self.commentary.round_index:
+                raise ValueError("public commentary round must match the event round")
+        elif self.commentary is not None:
+            raise ValueError("commentary is only valid on public_commentary events")
         try:
-            encoded = json.dumps(asdict(self.payload), ensure_ascii=False, separators=(",", ":"), default=str)
+            encoded = json.dumps(
+                {"payload": asdict(self.payload), "commentary": asdict(self.commentary) if self.commentary else None},
+                ensure_ascii=False, separators=(",", ":"), default=str,
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("event payload must be JSON serializable") from exc
         if len(encoded.encode("utf-8")) > MAX_EVENT_PAYLOAD_BYTES:
@@ -185,6 +259,7 @@ class EventSink(Protocol):
         *,
         round_index: int | None = None,
         tool_call_id: str | None = None,
+        commentary: PublicCommentary | None = None,
     ) -> bool: ...
 
 
@@ -197,11 +272,15 @@ class RequestAgentEventSink:
         consumer: Callable[[AgentEvent], Any] | None = None,
         *,
         max_events: int = MAX_EVENTS_PER_TASK,
+        public_commentary_enabled: bool | None = None,
     ) -> None:
         if max_events < 1:
             raise ValueError("max_events must be positive")
         self.identity = identity
         self._consumer = consumer
+        self._public_commentary_enabled = (
+            consumer is not None if public_commentary_enabled is None else bool(public_commentary_enabled)
+        )
         self._max_events = max_events
         self._sequence = 0
         self._published = 0
@@ -211,6 +290,14 @@ class RequestAgentEventSink:
     def sequence(self) -> int:
         return self._sequence
 
+    @property
+    def has_consumer(self) -> bool:
+        return self._consumer is not None
+
+    @property
+    def public_commentary_enabled(self) -> bool:
+        return self.has_consumer and self._public_commentary_enabled
+
     def emit(
         self,
         kind: AgentEventKind,
@@ -218,6 +305,7 @@ class RequestAgentEventSink:
         *,
         round_index: int | None = None,
         tool_call_id: str | None = None,
+        commentary: PublicCommentary | None = None,
     ) -> bool:
         if self._published >= self._max_events and kind.value not in _TERMINAL_KINDS:
             self.dropped_events += 1
@@ -233,6 +321,7 @@ class RequestAgentEventSink:
                 round_index=round_index,
                 tool_call_id=tool_call_id,
                 payload=payload or AgentEventPayload(),
+                commentary=commentary,
             )
         except (TypeError, ValueError):
             self.dropped_events += 1

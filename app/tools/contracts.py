@@ -139,6 +139,7 @@ class ToolSpec:
     output_kind: ToolOutputKind = ToolOutputKind.STRUCTURED
     data_requirements: tuple[str, ...] = ()
     progress_category: ToolCategory = ToolCategory.OTHER
+    expose_by_default: bool = True
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.strip():

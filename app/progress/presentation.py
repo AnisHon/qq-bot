@@ -34,6 +34,9 @@ _OUTCOME_TEXT = {
 
 def render_progress(candidate: ProgressCandidate) -> str:
     """Render only static categories and bounded outcome counts from real events."""
+    if candidate.commentary is not None:
+        text = candidate.commentary.text
+        return text.replace("[CQ:", "［CQ:").replace("[cq:", "［cq:")[:MAX_STATUS_CHARS]
     active = tuple(dict.fromkeys(candidate.categories))
     if candidate.active_tools:
         if candidate.mode == ProgressMode.VERBOSE and len(active) > 1:
