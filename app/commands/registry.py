@@ -76,12 +76,23 @@ class CommandRegistry:
                     return f"{exact.usage}\n{exact.description}"
             lines = [f"/{' '.join(target)} 可用子命令："]
         else:
-            lines = ["可用命令："]
-        paths = sorted({
-            spec.path
-            for spec in visible
-            if (len(spec.path) == len(target) + 1 if target else spec.handler is not None)
-        })
+            lines = ["可用命令（发送 /help <命令> 查看子命令）："]
+            visible_paths = {spec.path for spec in visible}
+            roots: dict[tuple[str, ...], CommandSpec] = {}
+            for spec in self.specs:
+                if len(spec.path) != 1 or (context is not None and not spec.policy.allows(context)):
+                    continue
+                if spec.handler is not None or any(
+                    candidate[:1] == spec.path for candidate in visible_paths if len(candidate) > 1
+                ):
+                    roots[spec.path] = spec
+            paths = sorted(roots)
+            for command_path in paths:
+                spec = roots[command_path]
+                lines.append(f"{spec.usage} — {spec.description}")
+            return "\n".join(lines)
+
+        paths = sorted(spec.path for spec in visible if len(spec.path) == len(target) + 1)
         for command_path in paths:
             spec = self._specs.get(command_path)
             if spec is None:
