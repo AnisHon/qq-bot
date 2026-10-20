@@ -15,6 +15,7 @@ import httpx
 
 from app.config import Settings
 from app.models import ChatReply, GroupMessageEvent
+from app.progress.reporter import FinalDeliveryStatus
 
 _IMPORT_STATE = tempfile.TemporaryDirectory(prefix="qq-bot-main-import-")
 _root_logger = logging.getLogger()
@@ -308,6 +309,7 @@ class OneBotAdmissionTest(unittest.IsolatedAsyncioTestCase):
 
             service = app.state.service
             adapter = app.state.adapter
+            reporter = app.state.progress_reporter
             event = GroupMessageEvent(
                 message_id="stale-reply",
                 group_id="fixture-group",
@@ -328,16 +330,15 @@ class OneBotAdmissionTest(unittest.IsolatedAsyncioTestCase):
                     new=AsyncMock(return_value=ChatReply("stale response", context_epoch=4)),
                 ),
                 patch.object(
-                    type(service), "is_context_epoch_current", new=AsyncMock(return_value=False)
-                ) as is_current,
-                patch("app.main.QQMessageDispatcher.send", new=AsyncMock()) as send,
+                    type(reporter), "send_final",
+                    new=AsyncMock(return_value=FinalDeliveryStatus.STALE_EPOCH),
+                ) as send_final,
             ):
                 # Exercise the actual event handler through the runtime-owned callback.
                 runtime = app.state.message_runtime
                 async with app.router.lifespan_context(app):
                     await runtime._handler(event)
-                    send.assert_not_awaited()
-            is_current.assert_awaited_once_with("fixture-group", 4)
+                    send_final.assert_awaited_once()
 
 
 if __name__ == "__main__":

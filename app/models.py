@@ -58,3 +58,4 @@ class ChatReply:
     should_send: bool = True
     context_epoch: int | None = None
     context_persisted: bool | None = None
+    task_id: str | None = None

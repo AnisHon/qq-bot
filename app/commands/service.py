@@ -48,7 +48,7 @@ from app.usage_budget import BudgetScope, reset_budget_scope, set_budget_scope
 LOGGER = logging.getLogger(__name__)
 CONFIRMATION_TTL_SECONDS = 300
 MAX_PENDING_CONFIRMATIONS = 128
-SAFE_GROUP_CONFIG_KEYS = frozenset({"model_provider", "default_pack"})
+SAFE_GROUP_CONFIG_KEYS = frozenset({"model_provider", "default_pack", "progress_mode"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +69,8 @@ class CommandService:
         self.memory_service = MemoryService(memory)
         self.llm_handler = llm_handler
         self.storage_executor = storage_executor
+        self.progress_coordinator = None
+        self.dispatcher = None
         self.registry = CommandRegistry()
         self.renderer = QQCommandRenderer()
         self._pending_confirmations: dict[str, _PendingConfirmation] = {}
@@ -78,7 +80,7 @@ class CommandService:
     def is_command_text(text: str) -> bool:
         return isinstance(text, str) and text.lstrip().startswith("/")
 
-    async def dispatch(self, event, text: str, on_tool_call=None) -> CommandResult:
+    async def dispatch(self, event, text: str, *, task_identity=None, event_sink=None) -> CommandResult:
         context = CommandContext(
             event=event,
             settings=self.settings,
@@ -87,13 +89,14 @@ class CommandService:
             storage_executor=self.storage_executor,
             request_id=str(event.message_id or secrets.token_hex(8)),
             is_admin=bool(event.user_id and self.settings.is_admin(event.user_id)),
+            task_identity=task_identity,
+            event_sink=event_sink,
             services={
                 "documents": self.llm_handler.document_knowledge,
                 "recipes": self.llm_handler.recipe_query_service,
                 "repositories": self.llm_handler.local_repository_service,
                 "sfm_knowledge": self.llm_handler.sfm_knowledge_service,
                 "sfm_validator": self.llm_handler.sfm_validation_service,
-                "on_tool_call": on_tool_call,
             },
         )
         return await self.registry.dispatch(text, context)
@@ -147,6 +150,10 @@ class CommandService:
         register(CommandSpec(("task", "cancel"), "取消本群的指定任务", "/task cancel <id>", self._task_cancel,
                              (ArgumentSpec("id", value_type="int"),), policy=admin))
 
+        root("agent", "查看当前正在运行的 AI Agent 任务")
+        register(CommandSpec(("agent", "status"), "查看本群当前 Agent 任务状态", "/agent status",
+                             self._agent_status))
+
         root("pack", "选择本群精确的 Minecraft 整合包数据版本")
         register(CommandSpec(("pack", "show"), "查看本群整合包选择", "/pack show", self._pack_show))
         register(CommandSpec(("pack", "list"), "列出实际可用的配方数据集", "/pack list", self._pack_list))
@@ -189,10 +196,21 @@ class CommandService:
 
         register(CommandSpec(("weather",), "查询天气", "/weather <location>", self._weather,
                              (ArgumentSpec("location", variadic=True, max_length=256),)))
-        register(CommandSpec(("news",), "搜索近期新闻", "/news [topic]", self._news,
-                             (ArgumentSpec("topic", variadic=True, required=False, max_length=256),)))
+        register(CommandSpec(("news",), "搜索近期新闻", "/news [topic] [--time-range day|week|month|year] [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--max-results 1-10]", self._news,
+                             (ArgumentSpec("topic", variadic=True, required=False, max_length=400),),
+                             (OptionSpec("time-range", choices=("day", "week", "month", "year")),
+                              OptionSpec("start-date", max_length=10), OptionSpec("end-date", max_length=10),
+                              OptionSpec("max-results", value_type="int"))))
         register(CommandSpec(("web",), "搜索网页或读取 URL", "/web <query-or-url>", self._web,
                              (ArgumentSpec("query", variadic=True, max_length=1024),)))
+        register(CommandSpec(("web", "search"), "搜索网页", "/web search <query> [--depth basic|fast|advanced|ultra-fast] [--time-range day|week|month|year] [--start-date YYYY-MM-DD] [--end-date YYYY-MM-DD] [--max-results 1-10]",
+                             self._web_search_command, (ArgumentSpec("query", variadic=True, max_length=400),),
+                             (OptionSpec("depth", choices=("basic", "fast", "advanced", "ultra-fast")),
+                              OptionSpec("time-range", choices=("day", "week", "month", "year")),
+                              OptionSpec("start-date", max_length=10), OptionSpec("end-date", max_length=10),
+                              OptionSpec("max-results", value_type="int"))))
+        register(CommandSpec(("web", "read"), "读取网页正文", "/web read <url>", self._web_read_command,
+                             (ArgumentSpec("url", max_length=4096),)))
 
         root("config", "查看或修改安全白名单内的群配置")
         register(CommandSpec(("config", "show"), "查看安全群配置", "/config show", self._config_show))
@@ -235,13 +253,20 @@ class CommandService:
         )
         tool_count = len(TOOL_REGISTRY.names())
         repositories = context.services["repositories"].configured_repo_ids
+        web_service = getattr(self.llm_handler, "web_research_service", None)
+        web_status = web_service.status_snapshot() if web_service is not None else {
+            "configured": False, "last_health": "unknown"
+        }
+        web_config = "configured" if web_status["configured"] else "NOT_CONFIGURED"
+        web_health = str(web_status["last_health"]).upper()
         return CommandResult.success(
             "Bot：正在运行\n"
             f"模型：{model_state}\n"
             f"本地知识：{document_state}\n"
             f"配方：{recipe_state}\n"
             f"Agent Tool Calling：{'启用' if self.settings.agent_tools_enabled else '关闭'}\n"
-            f"工具：{tool_count} 个已注册；本地 Git 白名单 {len(repositories)} 个；Web/天气连通性未主动探测\n"
+            f"工具：{tool_count} 个已注册；本地 Git 白名单 {len(repositories)} 个；"
+            f"Web Search：Tavily {web_config}；上次探测状态 {web_health}（/status 不发起请求）\n"
             f"SFM Validator：{sfm_state}"
         )
 
@@ -696,22 +721,42 @@ class CommandService:
 
     async def _news(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
         topic = command.arguments.get("topic") or "今天有什么新闻"
-        result = await self._dispatch_tool(context, "news_search", {"query": topic})
+        args: dict[str, Any] = {"query": topic}
+        for option in ("time_range", "start_date", "end_date", "max_results"):
+            if option in command.options:
+                args[option] = command.options[option]
+        result = await self._dispatch_tool(context, "news_search", args)
         return _tool_result(result, "新闻")
 
     async def _web(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
         query = command.arguments["query"]
         if query[:8].casefold().startswith(("https://", "http://")):
-            result = await self._dispatch_tool(context, "fetch_url", {"url": query})
+            result = await self._dispatch_tool(context, "web_read", {"url": query})
         else:
             result = await self._dispatch_tool(context, "web_search", {"query": query})
+        return _tool_result(result, "网页")
+
+    async def _web_search_command(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
+        args: dict[str, Any] = {"query": command.arguments["query"]}
+        for option in ("depth", "time_range", "start_date", "end_date", "max_results"):
+            if option in command.options:
+                args["search_depth" if option == "depth" else option] = command.options[option]
+        result = await self._dispatch_tool(context, "web_search", args)
+        return _tool_result(result, "网页")
+
+    async def _web_read_command(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
+        result = await self._dispatch_tool(context, "web_read", {"url": command.arguments["url"]})
         return _tool_result(result, "网页")
 
     async def _config_show(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
         provider = await self._group_setting(context, "model_provider")
         key = _selected_pack(await self._group_setting(context, "default_pack"))
         pack = f"{key.pack_id} {key.pack_version}（Minecraft {key.game_version}）" if key else "未选择"
-        return CommandResult.success(f"本群安全配置：\nmodel_provider：{provider or '使用默认模型'}\ndefault_pack：{pack}")
+        progress = await self._group_setting(context, "progress_mode") or "balanced"
+        return CommandResult.success(
+            f"本群安全配置：\nmodel_provider：{provider or '使用默认模型'}\n"
+            f"default_pack：{pack}\nprogress_mode：{progress}"
+        )
 
     async def _config_set(self, context: CommandContext, command: ParsedCommand) -> CommandResult:
         key = command.arguments["key"].casefold()
@@ -725,6 +770,18 @@ class CommandService:
             return await self._model_use(context, ParsedCommand(
                 self._spec(("model", "use")), {"model": value}, {}, raw_text=command.raw_text
             ))
+        if key == "progress_mode":
+            selected = value.casefold()
+            if selected not in {"quiet", "balanced", "verbose"}:
+                raise CommandError(
+                    CommandErrorKind.INVALID_ARGUMENT,
+                    "progress_mode 仅支持 quiet、balanced、verbose。",
+                )
+            if command.options:
+                raise CommandError(CommandErrorKind.INVALID_ARGUMENT, "progress_mode 不接受额外选项。")
+            await self._db(context, self.memory.set_group_setting,
+                            context.group_id, "progress_mode", selected)
+            return CommandResult.success(f"本群进度模式已设置为 {selected}。")
         version = command.options.get("version")
         game_version = command.options.get("game_version")
         if not version:
@@ -747,15 +804,40 @@ class CommandService:
                 requested_epoch = int(pending.target[len(target_prefix):])
             except ValueError:
                 raise CommandError(CommandErrorKind.NOT_FOUND, "确认操作已失效，请重新发起命令。") from None
+            if self.dispatcher is not None:
+                # Lock order is always group delivery barrier -> storage/coordinator.
+                # No Agent/task wait occurs while this lock is held.
+                async with self.dispatcher.delivery_barrier(context.group_id):
+                    return await self._apply_context_confirmation(context, pending, requested_epoch)
+            return await self._apply_context_confirmation(context, pending, requested_epoch)
+        if pending.operation == "memory.clear" and pending.target == f"group:{context.group_id}":
+            count = await self._db(context, self.memory.delete_memories_by_keyword,
+                                   "", scope="group", scope_id=context.group_id)
+            return CommandResult.success(f"已清空本群长期记忆，共 {count} 条。")
+        raise CommandError(CommandErrorKind.INVALID_ARGUMENT, "确认操作已失效，请重新发起命令。")
+
+    async def _apply_context_confirmation(
+        self, context: CommandContext, pending: _PendingConfirmation, requested_epoch: int
+    ) -> CommandResult:
+        coordinator = self.progress_coordinator
+        if coordinator is not None:
+            coordinator.begin_group_epoch_fence(context.group_id)
+        try:
             current_epoch = await self._db(context, self.memory.get_context_epoch, context.group_id)
             if current_epoch != requested_epoch:
                 raise CommandError(CommandErrorKind.NOT_FOUND, "群上下文版本已变化；请重新发起命令并确认新版本。")
             if pending.operation == "context.reset":
                 retained = await self._db(context, self.memory.reset_group_context, context.group_id)
+                new_epoch = await self._db(context, self.memory.get_context_epoch, context.group_id)
+                if coordinator is not None:
+                    coordinator.invalidate_group_epoch(context.group_id, new_epoch)
                 return CommandResult.success(
                     f"已开启新的上下文 epoch；旧 epoch 的 {retained} 条原始历史保留，但不会参与新会话检索。"
                 )
             hidden = await self._db(context, self.memory.begin_group_history_purge, context.group_id)
+            new_epoch = await self._db(context, self.memory.get_context_epoch, context.group_id)
+            if coordinator is not None:
+                coordinator.invalidate_group_epoch(context.group_id, new_epoch)
             batch = await self._db(context, self.memory.purge_group_history_batch, context.group_id, 500)
             if batch["complete"]:
                 return CommandResult.success(
@@ -765,11 +847,34 @@ class CommandService:
                 f"本群 {hidden} 条历史已隐藏并从检索中隔离；本批删除 {batch['deleted']} 条，"
                 f"尚余 {batch['remaining']} 条。再次执行 /context purge 并确认可继续分批删除。人工长期事实保留。"
             )
-        if pending.operation == "memory.clear" and pending.target == f"group:{context.group_id}":
-            count = await self._db(context, self.memory.delete_memories_by_keyword,
-                                   "", scope="group", scope_id=context.group_id)
-            return CommandResult.success(f"已清空本群长期记忆，共 {count} 条。")
-        raise CommandError(CommandErrorKind.INVALID_ARGUMENT, "确认操作已失效，请重新发起命令。")
+        except BaseException:
+            if coordinator is not None:
+                coordinator.abort_group_epoch_fence(context.group_id)
+            raise
+
+    async def _agent_status(self, context: CommandContext, _: ParsedCommand) -> CommandResult:
+        if self.progress_coordinator is None:
+            return CommandResult.success("当前没有可查询的 Agent 运行状态。")
+        rows = self.progress_coordinator.snapshot(
+            context.group_id, context.user_id, is_admin=context.is_admin,
+            exclude_task_id=(context.task_identity.task_id if context.task_identity else None),
+        )
+        if not rows:
+            return CommandResult.success("当前没有正在运行的 Agent 任务。")
+        # Do not expose other members' task ids, prompts, or evidence to administrators.
+        if context.is_admin:
+            active_tools = sum(int(row["active_tools"]) for row in rows)
+            return CommandResult.success(
+                f"本群当前有 {len(rows)} 个 Agent 任务运行中，{active_tools} 项工具正在执行。"
+            )
+        row = rows[0]
+        categories = row.get("categories", ())
+        if categories:
+            return CommandResult.success(
+                f"你的 Agent 任务正在运行：{len(categories)} 类工具已进入处理状态，"
+                f"其中 {row['active_tools']} 项仍在执行。"
+            )
+        return CommandResult.success("你的 Agent 任务正在运行。")
 
     def _request_confirmation(self, context: CommandContext, operation: str, target: str) -> CommandResult:
         self._purge_confirmations()
@@ -800,12 +905,6 @@ class CommandService:
             del self._pending_confirmations[key]
 
     async def _dispatch_tool(self, context: CommandContext, name: str, arguments: dict[str, Any]) -> ToolResult:
-        on_tool_call = context.services.get("on_tool_call")
-        if on_tool_call is not None:
-            try:
-                await on_tool_call("正在查询，请稍等。")
-            except Exception:  # noqa: BLE001
-                pass
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.settings.network_tool_timeout
         scope = BudgetScope(
@@ -816,12 +915,14 @@ class CommandService:
         budget_token = set_budget_scope(scope)
         try:
             tool_context = await self.llm_handler.command_tool_context(
-                context.event, deadline_monotonic=deadline
+                context.event, deadline_monotonic=deadline,
+                task_identity=context.task_identity, event_sink=context.event_sink,
+                tool_call_id=(f"command-{secrets.token_hex(8)}" if context.task_identity else None),
             )
-            return await asyncio.wait_for(
-                TOOL_REGISTRY.dispatch(name, arguments, tool_context),
-                timeout=self.settings.network_tool_timeout,
-            )
+            # ToolRegistry owns the tool timeout and request deadline. A same-sized
+            # outer wait_for races its timeout classification with cancellation and
+            # can report CANCELLED when the actual outcome was TIMED_OUT.
+            return await TOOL_REGISTRY.dispatch(name, arguments, tool_context)
         except asyncio.CancelledError:
             raise
         except TimeoutError:

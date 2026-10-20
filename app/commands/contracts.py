@@ -7,6 +7,7 @@ import re
 from typing import Any, Awaitable, Callable, Mapping
 
 from app.models import GroupMessageEvent
+from app.progress.events import EventSink, TaskIdentity
 
 
 class CommandErrorKind(StrEnum):
@@ -131,6 +132,8 @@ class CommandContext:
     request_id: str = ""
     is_admin: bool = False
     services: Mapping[str, Any] = field(default_factory=dict)
+    task_identity: TaskIdentity | None = None
+    event_sink: EventSink | None = field(default=None, repr=False)
 
     @property
     def group_id(self) -> str:

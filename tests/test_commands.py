@@ -29,6 +29,9 @@ from app.context.budget import ContextWindowBudget
 from app.knowledge.documents import DocumentIndexStatus, DocumentSource, IndexState
 from app.memory import MemoryStore
 from app.models import GroupMessageEvent
+from app.progress.coordinator import ProgressCoordinator
+from app.progress.events import AgentEventKind, AgentEventPayload, TaskIdentity, ToolCategory
+from app.qq_dispatcher import QQMessageDispatcher
 from app.recipes.models import (
     DatasetState,
     Ingredient,
@@ -258,6 +261,85 @@ class CommandServiceTest(unittest.TestCase):
         self.assertIn("/model show", flag_help.text)
         self.assertNotIn("/model use", flag_help.text)
 
+    def test_progress_mode_config_is_admin_only_group_scoped_and_shown(self) -> None:
+        service = self.service()
+        denied = _run(service.handle_group_message(_event(
+            "/config set progress_mode verbose", group="group-a", user="member"
+        )))
+        self.assertEqual(denied.text, "你没有权限执行此命令。")
+        updated = _run(service.handle_group_message(_event(
+            "/config set progress_mode quiet", group="group-a", user="admin"
+        )))
+        self.assertIn("已设置为 quiet", updated.text)
+        self.assertEqual(self.memory.get_group_setting("group-a", "progress_mode"), "quiet")
+        self.assertIsNone(self.memory.get_group_setting("group-b", "progress_mode"))
+        shown = _run(service.handle_group_message(_event(
+            "/config show", group="group-a", user="member"
+        )))
+        self.assertIn("progress_mode：quiet", shown.text)
+        invalid = _run(service.handle_group_message(_event(
+            "/config set progress_mode loud", group="group-a", user="admin"
+        )))
+        self.assertIn("仅支持 quiet、balanced、verbose", invalid.text)
+
+    def test_agent_status_reads_live_scoped_coordinator_without_exposing_task_details(self) -> None:
+        service = self.service()
+        coordinator = ProgressCoordinator()
+        service.configure_progress(coordinator, object())
+        identity = TaskIdentity.create(
+            request_id="private-query-id", group_id="group-a", user_id="member",
+            epoch=0, origin="user_message",
+        )
+        sink = coordinator.register(identity)
+        sink.emit(AgentEventKind.TASK_STARTED)
+        sink.emit(AgentEventKind.TOOL_STARTED, AgentEventPayload(
+            category=ToolCategory.WEB_SEARCH,
+        ), tool_call_id="private-tool-id")
+
+        own = _run(service.handle_group_message(_event(
+            "/agent status", group="group-a", user="member"
+        )))
+        other = _run(service.handle_group_message(_event(
+            "/agent status", group="group-a", user="stranger"
+        )))
+        admin = _run(service.handle_group_message(_event(
+            "/agent status", group="group-a", user="admin"
+        )))
+        self.assertIn("你的 Agent 任务正在运行", own.text)
+        self.assertIn("没有正在运行", other.text)
+        self.assertIn("1 个 Agent 任务", admin.text)
+        self.assertNotIn("private-query-id", admin.text)
+        self.assertNotIn("member", admin.text)
+
+    def test_confirmed_context_reset_fences_live_progress_inside_dispatcher_barrier(self) -> None:
+        service = self.service()
+        coordinator = ProgressCoordinator()
+        dispatcher = QQMessageDispatcher(adapter=object(), max_chars=500)  # type: ignore[arg-type]
+        service.configure_progress(coordinator, dispatcher)
+
+        async def exercise() -> None:
+            identity = TaskIdentity.create(
+                request_id="old-task", group_id="group-a", user_id="member",
+                epoch=0, origin="user_message",
+            )
+            sink = coordinator.register(identity)
+            sink.emit(AgentEventKind.TASK_STARTED)
+            sink.emit(AgentEventKind.TOOL_STARTED, AgentEventPayload(
+                category=ToolCategory.WEB_SEARCH,
+            ), tool_call_id="search")
+            requested = await service.handle_group_message(
+                _event("/context reset", group="group-a", user="admin")
+            )
+            token = requested.text.rsplit(" ", 1)[-1]
+            confirmed = await service.handle_group_message(
+                _event(f"/confirm {token}", group="group-a", user="admin")
+            )
+            self.assertIn("开启新的上下文 epoch", confirmed.text)
+            self.assertEqual(coordinator.snapshot("group-a", "member"), ())
+            self.assertEqual(coordinator.metrics["epoch_fenced"], 2)
+
+        _run(exercise())
+
     def test_unknown_slash_is_not_sent_to_llm_and_regular_message_is(self) -> None:
         llm = _DummyLLM("regular")
         service = self.service(llm)
@@ -267,6 +349,33 @@ class CommandServiceTest(unittest.TestCase):
         regular = _run(service.handle_group_message(_event("regular question", user="member", is_at_bot=True)))
         self.assertEqual(regular.text, "regular")
         self.assertEqual(llm.calls, 1)
+
+    def test_web_and_news_commands_route_through_tool_registry_without_llm(self) -> None:
+        from app.tools.contracts import ToolResult, ToolStatus
+
+        llm = _DummyLLM("must not be called")
+        service = self.service(llm)
+        result = ToolResult(ToolStatus.OK, {"text": "fixture web response"})
+        with patch("app.commands.service.TOOL_REGISTRY.dispatch", new=AsyncMock(return_value=result)) as dispatch:
+            web = _run(service.handle_group_message(_event(
+                "/web search GTNH 铂处理 --depth basic --start-date 2026-09-01 --end-date 2026-10-01"
+            )))
+            read = _run(service.handle_group_message(_event("/web read https://example.org/article")))
+            news = _run(service.handle_group_message(_event("/news GregTech --time-range week")))
+
+        self.assertIn("fixture web response", web.text)
+        self.assertIn("fixture web response", read.text)
+        self.assertIn("fixture web response", news.text)
+        self.assertEqual(dispatch.await_count, 3)
+        self.assertEqual(dispatch.await_args_list[0].args[0], "web_search")
+        self.assertEqual(dispatch.await_args_list[0].args[1]["query"], "GTNH 铂处理")
+        self.assertEqual(dispatch.await_args_list[0].args[1]["start_date"], "2026-09-01")
+        self.assertEqual(dispatch.await_args_list[0].args[1]["end_date"], "2026-10-01")
+        self.assertEqual(dispatch.await_args_list[1].args[0], "web_read")
+        self.assertEqual(dispatch.await_args_list[1].args[1]["url"], "https://example.org/article")
+        self.assertEqual(dispatch.await_args_list[2].args[0], "news_search")
+        self.assertEqual(dispatch.await_args_list[2].args[1]["time_range"], "week")
+        self.assertEqual(llm.calls, 0)
 
     def test_destructive_confirmation_is_bound_to_user_group_operation_and_single_use(self) -> None:
         service = self.service()
@@ -526,6 +635,8 @@ class CommandServiceTest(unittest.TestCase):
         self.assertNotIn("api_key", shown.text)
         self.assertNotIn("secret", shown.text)
         self.assertIn("本地 Git 白名单", status.text)
+        self.assertIn("Web Search：Tavily NOT_CONFIGURED", status.text)
+        self.assertIn("/status 不发起请求", status.text)
         self.assertNotIn("fixture-key", status.text)
 
     def test_pack_use_rejects_missing_exact_dataset_and_does_not_write_setting(self) -> None:

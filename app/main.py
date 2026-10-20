@@ -21,6 +21,8 @@ from app.logging_ctx import install_context_filter, new_context, request_ctx
 from app.natcapqq_adapter import NatcapQQAdapter
 from app.rag import RagStore
 from app.qq_dispatcher import EventDeduplicator, QQMessageDispatcher
+from app.progress.coordinator import ProgressCoordinator
+from app.progress.reporter import FinalDeliveryStatus, QQProgressReporter
 from app.storage_executor import StorageExecutor
 from app.task_runtime import MessageTaskRuntime
 from app.usage_budget import BudgetController, BudgetLimits, UsageBudgetStore
@@ -233,6 +235,17 @@ def create_app() -> FastAPI:
         storage_executor=storage_executor,
     )
     dispatcher = QQMessageDispatcher(adapter=adapter, max_chars=settings.qq_message_max_chars)
+    progress_coordinator = ProgressCoordinator()
+
+    async def _read_current_epoch(group_id: str) -> int:
+        return await storage_executor.run_sqlite(memory.get_context_epoch, str(group_id))
+
+    progress_reporter = QQProgressReporter(
+        progress_coordinator,
+        dispatcher,
+        read_epoch=_read_current_epoch,
+    )
+    service.configure_progress(progress_coordinator, dispatcher)
     event_deduplicator = EventDeduplicator()
 
     app = FastAPI(title="qq-deepseek-bot")
@@ -243,6 +256,8 @@ def create_app() -> FastAPI:
     app.state.llms = llms
     app.state.adapter = adapter
     app.state.service = service
+    app.state.progress_coordinator = progress_coordinator
+    app.state.progress_reporter = progress_reporter
     app.state.storage_executor = storage_executor
     app.state.usage_budget_controller = budget_controller
     app.state.context_window_budget = context_window_budget
@@ -268,6 +283,8 @@ def create_app() -> FastAPI:
                 await scheduler_task
         if message_runtime is not None:
             await message_runtime.aclose(settings.shutdown_drain_timeout)
+        await progress_reporter.aclose(settings.shutdown_drain_timeout)
+        await progress_coordinator.aclose(settings.shutdown_drain_timeout)
         await storage_executor.aclose(settings.shutdown_drain_timeout)
         await adapter.aclose()
         closed: set[int] = set()
@@ -311,6 +328,8 @@ def create_app() -> FastAPI:
             message_runtime.spawn_background(
                 _rebuild_context_search_indexes(), name="context-search-fts-backfill"
             )
+        progress_coordinator.start()
+        progress_reporter.start()
         app.state.scheduler_task = asyncio.create_task(_scheduled_task_loop())
 
     async def _rebuild_context_search_indexes() -> None:
@@ -400,41 +419,20 @@ def create_app() -> FastAPI:
         event.bot_names = await _resolve_bot_names(event.group_id)
         ctx = new_context(group_id=str(event.group_id), user_id=str(event.user_id))
         token = request_ctx.set(ctx)
-        expected_reply = service.expects_reply(event)
-        network_notice_sent = False
-
-        # Report work when the agent actually chooses a tool.
-        async def on_tool_call(status_text: str = "正在联网查询，稍等。") -> None:
-            nonlocal network_notice_sent
-            network_notice_sent = True
-            try:
-                await dispatcher.send(event.group_id, status_text, status=True)
-            except Exception:  # noqa: BLE001
-                logger.exception("failed to send tool call notice")
-
-        task = asyncio.create_task(service.handle_group_message(event, on_tool_call=on_tool_call))
+        task = asyncio.create_task(service.handle_group_message(event))
         try:
-            try:
-                reply = await asyncio.wait_for(
-                    asyncio.shield(task),
-                    timeout=settings.reply_notice_delay,
-                )
-            except asyncio.TimeoutError:
-                if expected_reply and not network_notice_sent:
-                    try:
-                        await dispatcher.send(event.group_id, "正在处理，稍等。", status=True)
-                    except Exception:  # noqa: BLE001
-                        logger.exception("failed to send wait notice")
-                reply = await task
+            reply = await task
 
             if reply and reply.should_send:
-                if (
-                    reply.context_epoch is not None
-                    and not await service.is_context_epoch_current(event.group_id, reply.context_epoch)
-                ):
-                    logger.info("discarded reply from stale context epoch")
+                delivery = await progress_reporter.send_final(
+                    event.group_id,
+                    reply.text,
+                    reply_to=event.message_id,
+                    task_id=reply.task_id,
+                    epoch=reply.context_epoch,
+                )
+                if delivery != FinalDeliveryStatus.ACCEPTED_BY_ADAPTER:
                     return
-                await dispatcher.send(event.group_id, reply.text, reply_to=event.message_id)
                 if not service.is_command_event(event):
                     assert message_runtime is not None
                     message_runtime.spawn_background(
@@ -494,18 +492,8 @@ def create_app() -> FastAPI:
             await storage_executor.run_sqlite(memory.release_scheduled_task, task_id)
             return
 
-        task_notice_sent = False
-
-        async def on_tool_call(status_text: str = "正在联网查询，稍等。") -> None:
-            nonlocal task_notice_sent
-            task_notice_sent = True
-            try:
-                await dispatcher.send(group_id, f"定时任务 #{task_id}：{status_text}", status=True)
-            except Exception:  # noqa: BLE001
-                logger.exception("failed to send scheduled task tool notice")
-
         try:
-            reply_text = await service.run_scheduled_task(task_row, on_tool_call=on_tool_call)
+            reply_text = await service.run_scheduled_task(task_row)
             if reply_text is None:
                 await storage_executor.run_sqlite(memory.release_scheduled_task, task_id)
                 return

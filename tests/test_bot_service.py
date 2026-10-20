@@ -13,7 +13,6 @@ from app.bot_service import (
     _sanitize_qq_text,
 )
 from app.handlers.task_handler import _parse_task_schedule
-from app.tools.external import _is_generic_news_query
 from app.config import Settings
 from app.memory import MemoryStore
 from app.models import GroupMessageEvent, QuotedMessage, SearchResult
@@ -58,13 +57,6 @@ print(1)
         text = _sanitize_qq_text("<｜｜DSML｜｜tool_calls>hidden</｜｜DSML｜｜tool_calls>")
         self.assertNotIn("DSML", text)
         self.assertIn("请稍后重试", text)
-
-
-class NewsQueryTest(unittest.TestCase):
-    def test_date_rewritten_generic_news_query(self) -> None:
-        self.assertTrue(_is_generic_news_query("今天有什么新闻"))
-        self.assertTrue(_is_generic_news_query("2026年7月12日 新闻 热点"))
-        self.assertFalse(_is_generic_news_query("2026年7月12日 科技新闻"))
 
 
 class CommandTest(unittest.TestCase):
