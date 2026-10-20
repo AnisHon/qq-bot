@@ -16,6 +16,7 @@ from app.tools.contracts import (
     ToolStatus,
     ToolUsage,
 )
+from app.progress.events import AgentEventKind, AgentEventPayload, ToolOutcome
 
 
 LOGGER = logging.getLogger(__name__)
@@ -107,6 +108,13 @@ def _validate_value(value: Any, schema: dict[str, Any], field_name: str) -> Any:
             if not isinstance(child_schema, dict):
                 raise ToolArgumentError("invalid tool schema", key_path)
             _validate_value(item, child_schema, key_path)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            raise ToolArgumentError("number is below the allowed minimum", field_name or None)
+        if isinstance(maximum, (int, float)) and value > maximum:
+            raise ToolArgumentError("number exceeds the allowed maximum", field_name or None)
     return value
 
 
@@ -215,10 +223,16 @@ class ToolRegistry:
     async def dispatch(self, name: str, raw_arguments: str | dict[str, Any], context: ToolContext) -> ToolResult:
         spec = self._specs.get(name)
         if spec is None:
+            self._emit(context, AgentEventKind.TOOL_REJECTED, AgentEventPayload(
+                outcome=ToolOutcome.REJECTED, execution_started=False,
+            ))
             return self._failure(ToolStatus.INVALID_ARGUMENT, "unknown_tool", "Unknown tool.")
 
         denial = spec.policy.denial_reason(name, context)
         if denial:
+            self._emit(context, AgentEventKind.TOOL_REJECTED, AgentEventPayload(
+                category=spec.progress_category, outcome=ToolOutcome.DENIED, execution_started=False,
+            ))
             return self._failure(ToolStatus.DENIED, "tool_denied", "This tool is not permitted.")
         try:
             arguments = _decode_arguments(raw_arguments)
@@ -228,6 +242,9 @@ class ToolRegistry:
                     raise ToolArgumentError("validator must return an object")
             arguments = validate_arguments(spec.parameters, arguments)
         except ToolArgumentError as exc:
+            self._emit(context, AgentEventKind.TOOL_REJECTED, AgentEventPayload(
+                category=spec.progress_category, outcome=ToolOutcome.REJECTED, execution_started=False,
+            ))
             return self._failure(
                 ToolStatus.INVALID_ARGUMENT,
                 "invalid_arguments",
@@ -236,6 +253,9 @@ class ToolRegistry:
             )
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("tool %s argument validator failed (%s)", name, type(exc).__name__)
+            self._emit(context, AgentEventKind.TOOL_REJECTED, AgentEventPayload(
+                category=spec.progress_category, outcome=ToolOutcome.ERROR, execution_started=False,
+            ))
             return self._failure(ToolStatus.ERROR, "argument_validation_error", "Tool argument validation failed.")
 
         loop = asyncio.get_running_loop()
@@ -248,6 +268,9 @@ class ToolRegistry:
         deadline_limited = False
         if remaining is not None:
             if remaining <= 0:
+                self._emit(context, AgentEventKind.TOOL_REJECTED, AgentEventPayload(
+                    category=spec.progress_category, outcome=ToolOutcome.TIMEOUT, execution_started=False,
+                ))
                 return self._failure(ToolStatus.TIMED_OUT, "deadline_expired", "Request deadline expired.")
             deadline_limited = (
                 remaining <= spec.timeout_seconds
@@ -256,33 +279,106 @@ class ToolRegistry:
             timeout = min(timeout, remaining)
 
         semaphore = self._semaphores.setdefault(name, asyncio.Semaphore(spec.max_concurrency))
+        started = False
         try:
             async with asyncio.timeout(timeout):
                 await semaphore.acquire()
                 try:
+                    started = True
+                    self._emit(context, AgentEventKind.TOOL_STARTED, AgentEventPayload(
+                        category=spec.progress_category, execution_started=True,
+                    ))
                     result = await spec.handler(context, arguments)
                 finally:
                     semaphore.release()
         except asyncio.CancelledError:
+            self._emit(context, AgentEventKind.TOOL_CANCELLED, AgentEventPayload(
+                category=spec.progress_category,
+                outcome=ToolOutcome.CANCELLED,
+                execution_started=started,
+            ))
             raise
         except TimeoutError:
+            self._emit(context, AgentEventKind.TOOL_FAILED if started else AgentEventKind.TOOL_REJECTED,
+                       AgentEventPayload(
+                           category=spec.progress_category,
+                           outcome=ToolOutcome.TIMEOUT,
+                           execution_started=started,
+                       ))
             if deadline_limited:
                 # Let the Agent's request-level deadline cancel sibling calls
                 # and run its existing cancellation cleanup path.
                 raise
             return self._failure(ToolStatus.TIMED_OUT, "tool_timeout", "Tool execution timed out.", retryable=True)
         except ToolInvocationError as exc:
-            return ToolResult(status=exc.status, content=exc.error.message, error=exc.error)
+            result = ToolResult(status=exc.status, content=exc.error.message, error=exc.error)
+            self._emit_result(context, spec.progress_category, result)
+            return result
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("tool %s handler failed (%s)", name, type(exc).__name__)
-            return self._failure(ToolStatus.ERROR, "tool_execution_error", "Tool execution failed.", retryable=True)
+            result = self._failure(ToolStatus.ERROR, "tool_execution_error", "Tool execution failed.", retryable=True)
+            self._emit(context, AgentEventKind.TOOL_FAILED, AgentEventPayload(
+                category=spec.progress_category, outcome=ToolOutcome.ERROR, execution_started=True,
+            ))
+            return result
 
         if not isinstance(result, ToolResult):
-            return self._failure(ToolStatus.ERROR, "invalid_tool_result", "Tool returned an invalid result.")
+            invalid = self._failure(ToolStatus.ERROR, "invalid_tool_result", "Tool returned an invalid result.")
+            self._emit(context, AgentEventKind.TOOL_FAILED, AgentEventPayload(
+                category=spec.progress_category, outcome=ToolOutcome.ERROR, execution_started=True,
+            ))
+            return invalid
         result_limit = spec.max_result_chars
         if context.result_max_chars is not None:
             result_limit = min(result_limit, max(1, context.result_max_chars))
-        return self._limit_result(result, result_limit, context.evidence_limit)
+        limited = self._limit_result(result, result_limit, context.evidence_limit)
+        self._emit_result(context, spec.progress_category, limited)
+        return limited
+
+    @staticmethod
+    def _emit(context: ToolContext, kind: AgentEventKind, payload: AgentEventPayload) -> None:
+        if context.event_sink is None or context.task_identity is None:
+            return
+        try:
+            context.event_sink.emit(
+                kind,
+                payload,
+                round_index=context.agent_round,
+                tool_call_id=context.tool_call_id,
+            )
+        except Exception:  # noqa: BLE001 - instrumentation is isolated from tool outcomes
+            LOGGER.debug("tool lifecycle event was dropped", exc_info=True)
+
+    @classmethod
+    def _emit_result(cls, context: ToolContext, category, result: ToolResult) -> None:
+        if result.status == ToolStatus.CANCELLED:
+            event_kind = AgentEventKind.TOOL_CANCELLED
+        elif result.status in {
+            ToolStatus.ERROR, ToolStatus.INVALID_ARGUMENT, ToolStatus.DENIED, ToolStatus.TIMED_OUT,
+        }:
+            event_kind = AgentEventKind.TOOL_FAILED
+        else:
+            event_kind = AgentEventKind.TOOL_COMPLETED
+        outcome = {
+            ToolStatus.OK: ToolOutcome.SUCCESS,
+            ToolStatus.PARTIAL: ToolOutcome.PARTIAL,
+            ToolStatus.NO_RESULTS: ToolOutcome.NO_RESULTS,
+            ToolStatus.DATA_UNAVAILABLE: ToolOutcome.UNAVAILABLE,
+            ToolStatus.NOT_INDEXED: ToolOutcome.UNAVAILABLE,
+            ToolStatus.VERSION_MISMATCH: ToolOutcome.UNAVAILABLE,
+            ToolStatus.INVALID_ARGUMENT: ToolOutcome.REJECTED,
+            ToolStatus.DENIED: ToolOutcome.DENIED,
+            ToolStatus.TIMED_OUT: ToolOutcome.TIMEOUT,
+            ToolStatus.CANCELLED: ToolOutcome.CANCELLED,
+            ToolStatus.ERROR: ToolOutcome.ERROR,
+        }.get(result.status, ToolOutcome.UNKNOWN)
+        cls._emit(context, event_kind, AgentEventPayload(
+            category=category,
+            outcome=outcome,
+            execution_started=True,
+            evidence_count=len(result.evidence),
+            completeness=result.completeness,
+        ))
 
     @staticmethod
     def _failure(

@@ -91,6 +91,34 @@ class AgentCompactionTest(IsolatedAsyncioTestCase):
         self.assertIsNone(store.read_segment(refs[0], request_id="r1", group_id="g1", user_id="u2", epoch=2))
         self.assertIsNone(store.read_segment(refs[0], request_id="r1", group_id="g1", user_id="u1", epoch=3))
 
+    def test_web_evidence_metadata_survives_request_local_archival(self) -> None:
+        store = EvidenceStore()
+        result = ToolResult(
+            status=ToolStatus.PARTIAL,
+            content={"text": "search snippet"},
+            evidence=(Evidence(
+                kind="web_search_result", source_id="web:abc", title="Fixture source",
+                locator="https://example.org/article", provider="tavily",
+                retrieved_at="2026-10-20T10:00:00+00:00", published_at="2026-10-01",
+                completeness="partial", content_hash="source-hash",
+                query_conditions=(("query", "fixture"),),
+            ),),
+            completeness="partial",
+        )
+        refs = store.add_result(
+            result, request_id="r1", group_id="g1", user_id="u1", epoch=1, tool_call_id="web-call",
+        )
+        metadata = store.metadata_for(
+            refs[0], request_id="r1", group_id="g1", user_id="u1", epoch=1,
+        )
+        self.assertEqual(metadata["locator"], "https://example.org/article")
+        self.assertEqual(metadata["title"], "Fixture source")
+        self.assertEqual(metadata["provider"], "tavily")
+        self.assertEqual(metadata["retrieved_at"], "2026-10-20T10:00:00+00:00")
+        self.assertEqual(metadata["published_at"], "2026-10-01")
+        self.assertEqual(metadata["source_hash"], "source-hash")
+        self.assertEqual(metadata["completeness"], "partial")
+
     def test_registry_clipping_marks_observation_and_evidence_partial(self) -> None:
         source = ToolResult(
             status=ToolStatus.OK,

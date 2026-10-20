@@ -4,13 +4,14 @@ import asyncio
 from dataclasses import replace
 import time
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from app.llm import ChatWithToolsResponse, ToolCallRequest
 from app.context.contracts import ContextEpochChanged
 from app.models import SearchResult
 from app.tools.agent import TOOL_REGISTRY
 from app.tools.contracts import search_results_to_tool_result
+from app.progress.events import AgentEventKind, RequestAgentEventSink, TaskIdentity
 from app.tools.agent import _parse_dsml_tool_calls, _tool_call_message, _tool_signature, _validate_research_answer, run_agent_loop
 
 
@@ -184,22 +185,26 @@ class AgentLoopTest(IsolatedAsyncioTestCase):
         self.assertTrue(all(0 < timeout < 10 for timeout in passed_timeouts))
         self.assertLess(time.monotonic() - started_at, 0.5)
 
-    async def test_progress_notification_is_inside_request_deadline(self) -> None:
+    async def test_registry_lifecycle_events_do_not_await_progress_delivery(self) -> None:
         llm = _ToolRequestLLM(tool_count=1)
-        notice_started = asyncio.Event()
-        notice_cancelled = asyncio.Event()
-        tool = AsyncMock()
+        tool_started = asyncio.Event()
+        tool_cancelled = asyncio.Event()
+        events = []
 
-        async def blocking_notice(*_args):
-            notice_started.set()
+        async def blocked_tool(_context, _arguments):
+            tool_started.set()
             try:
                 await asyncio.Event().wait()
             except asyncio.CancelledError:
-                notice_cancelled.set()
+                tool_cancelled.set()
                 raise
 
         weather_spec = TOOL_REGISTRY.get("weather")
-        with patch.dict(TOOL_REGISTRY._specs, {"weather": replace(weather_spec, handler=tool)}):
+        identity = TaskIdentity.create(
+            request_id="progress-test", group_id="g1", user_id="u1", epoch=0, origin="user_message"
+        )
+        sink = RequestAgentEventSink(identity, events.append)
+        with patch.dict(TOOL_REGISTRY._specs, {"weather": replace(weather_spec, handler=blocked_tool)}):
             with self.assertRaises(TimeoutError):
                 await run_agent_loop(
                     llm,
@@ -210,12 +215,22 @@ class AgentLoopTest(IsolatedAsyncioTestCase):
                     total_timeout=0.02,
                     tool_timeout=1,
                     results_max_chars=2000,
-                    on_tool_call=blocking_notice,
+                    task_identity=identity,
+                    event_sink=sink,
                 )
 
-        self.assertTrue(notice_started.is_set())
-        self.assertTrue(notice_cancelled.is_set())
-        tool.assert_not_awaited()
+        self.assertTrue(tool_started.is_set())
+        self.assertTrue(tool_cancelled.is_set())
+        self.assertEqual(
+            [event.kind for event in events],
+            [
+                AgentEventKind.WORKING_STATE_NOT_CONFIGURED,
+                AgentEventKind.MODEL_REQUEST_STARTED,
+                AgentEventKind.MODEL_REQUEST_COMPLETED,
+                AgentEventKind.TOOL_STARTED,
+                AgentEventKind.TOOL_FAILED,
+            ],
+        )
 
     async def test_total_deadline_cancels_model_call_and_skips_final_call(self) -> None:
         class BlockingModel(_ToolRequestLLM):

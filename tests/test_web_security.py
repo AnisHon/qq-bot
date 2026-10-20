@@ -197,7 +197,7 @@ class URLPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resolver.calls[-1][0], "internal.example")
 
     async def test_jina_reader_compatibility_shim_never_fetches_remote_target(self) -> None:
-        with patch.object(external, "_bing_client", side_effect=AssertionError("network call")):
+        with patch.object(external, "_external_client", side_effect=AssertionError("network call")):
             results = await external._fetch_via_jina(
                 "http://127.0.0.1/private?token=synthetic",
                 timeout=1,

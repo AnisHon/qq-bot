@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import time
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 from app.context.budget import ContextBudgetDecision, ContextWindowBudget, ContextWindowError
 from app.context.contracts import ContextMessagePlan
@@ -52,6 +52,9 @@ class EvidenceRecord:
     pack_id: str | None
     pack_version: str | None
     query_conditions: tuple[tuple[str, str], ...]
+    provider: str | None
+    retrieved_at: str | None
+    published_at: str | None
     content: str
     completeness: Literal["complete", "partial", "reference_only", "unavailable"]
     created_at: float
@@ -113,7 +116,7 @@ class EvidenceStore:
         if not sources:
             source_rows = [(
                 "tool_output", f"tool:{tool_call_id}", "Tool output", "",
-                None, None, None, None, None, (), "reference_only", None,
+                None, None, None, None, None, (), "reference_only", None, None, None, None,
             )]
         else:
             source_rows = [
@@ -131,12 +134,16 @@ class EvidenceStore:
                     tuple(sorted((str(k), str(v)) for k, v in evidence.query_conditions)),
                     evidence.completeness,
                     evidence.content_hash,
+                    evidence.provider,
+                    evidence.retrieved_at,
+                    evidence.published_at,
                 )
                 for evidence in sources
             ]
         for index, (
             kind, source_id, title, locator, revision, pack_id, pack_version,
             version, confidence, conditions, source_completeness, source_hash,
+            provider, retrieved_at, published_at,
         ) in enumerate(source_rows):
             record_id = f"ev:{request_id}:{tool_call_id}:{index}"
             record = EvidenceRecord(
@@ -157,6 +164,9 @@ class EvidenceStore:
                 pack_id=pack_id,
                 pack_version=pack_version,
                 query_conditions=conditions,
+                provider=provider,
+                retrieved_at=retrieved_at,
+                published_at=published_at,
                 content=clipped,
                 completeness=("partial" if completeness == "partial" or source_completeness == "partial" else completeness),
                 created_at=now,
@@ -226,6 +236,9 @@ class EvidenceStore:
             "pack_id": record.pack_id,
             "pack_version": record.pack_version,
             "query_conditions": dict(record.query_conditions),
+            "provider": record.provider,
+            "retrieved_at": record.retrieved_at,
+            "published_at": record.published_at,
             "completeness": record.completeness,
         }
 
@@ -261,6 +274,7 @@ class AgentContextCompactor:
         profile_key: str | None,
         max_tokens: int = 2048,
         working_state: dict[str, Any] | None = None,
+        on_compaction_start: Callable[[], None] | None = None,
     ) -> CompactionResult:
         for block in blocks:
             self.validate_protocol_block(block)
@@ -315,12 +329,16 @@ class AgentContextCompactor:
                     raise
             optional = [plan for plan in context_plan if not plan.required and plan.message_index in kept_indices]
             if optional:
+                if on_compaction_start is not None and not removed and not archived:
+                    on_compaction_start()
                 victim = min(optional, key=lambda plan: (plan.priority, plan.message_index))
                 kept_indices.remove(victim.message_index)
                 removed.append(victim.item_key)
                 continue
             # Archive the oldest complete prior round as a single indivisible unit.
             if kept_blocks:
+                if on_compaction_start is not None and not removed and not archived:
+                    on_compaction_start()
                 victim_block = kept_blocks.pop(0)
                 archived.append(victim_block)
                 continue

@@ -7,6 +7,7 @@ import re
 from typing import Any, Awaitable, Callable, Literal, Mapping, TYPE_CHECKING
 
 from app.models import SearchResult
+from app.progress.events import EventSink, TaskIdentity, ToolCategory
 from app.usage_budget import BudgetScope, ToolUsage
 
 if TYPE_CHECKING:
@@ -53,6 +54,9 @@ class Evidence:
     completeness: Literal["complete", "partial", "reference_only", "unavailable"] = "reference_only"
     content_hash: str | None = None
     query_conditions: tuple[tuple[str, str], ...] = ()
+    provider: str | None = None
+    retrieved_at: str | None = None
+    published_at: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +114,10 @@ class ToolContext:
     evidence_limit: int = 8
     tool_timeout_seconds: float | None = None
     result_max_chars: int | None = None
+    task_identity: TaskIdentity | None = None
+    event_sink: EventSink | None = field(default=None, repr=False, compare=False)
+    tool_call_id: str | None = field(default=None, repr=False, compare=False)
+    agent_round: int | None = field(default=None, repr=False, compare=False)
     extensions: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
 
@@ -130,6 +138,7 @@ class ToolSpec:
     max_result_chars: int = 16_000
     output_kind: ToolOutputKind = ToolOutputKind.STRUCTURED
     data_requirements: tuple[str, ...] = ()
+    progress_category: ToolCategory = ToolCategory.OTHER
 
     def __post_init__(self) -> None:
         if not self.name or not self.name.strip():

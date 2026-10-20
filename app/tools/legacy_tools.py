@@ -22,15 +22,12 @@ from app.tools.contracts import (
     format_search_results,
     search_results_to_tool_result,
 )
+from app.progress.events import ToolCategory
 from app.tools.external import (
-    fetch_web_page,
     get_weather,
     inspect_github_repository,
-    multi_search,
     read_github_file,
     search_github_repositories,
-    search_news,
-    search_web,
 )
 from app.repositories.local_git import (
     LocalGitRepositoryService,
@@ -64,8 +61,8 @@ def normalize_legacy_arguments(name: str, arguments: dict[str, Any]) -> dict[str
     normalized = dict(arguments)
     if name == "weather" and "location" not in normalized and "query" in normalized:
         normalized["location"] = normalized.pop("query")
-    if name in {"weather_batch", "multi_search"}:
-        key = "locations" if name == "weather_batch" else "queries"
+    if name == "weather_batch":
+        key = "locations"
         if isinstance(normalized.get(key), str):
             normalized[key] = [normalized[key]]
     return normalized
@@ -280,21 +277,19 @@ async def _weather_batch(context: ToolContext, arguments: dict[str, Any]) -> Too
 
 
 async def _news_search(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-    return await _cached(
-        "news_search",
-        arguments,
-        context,
-        lambda: search_news(arguments["query"], timeout=_timeout(context)),
-    )
-
-
-async def _multi_search(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-    queries = list(dict.fromkeys(query.strip() for query in arguments["queries"] if query.strip()))[:6]
-    return await _cached(
-        "multi_search",
-        {"queries": queries},
-        context,
-        lambda: multi_search(queries, timeout=_timeout(context)),
+    service = context.extensions.get("web_research_service")
+    if service is None:
+        return ToolResult(
+            ToolStatus.DATA_UNAVAILABLE,
+            "Tavily Web Search 未配置（NOT_CONFIGURED）。",
+            error=ToolError("not_configured", "Tavily Web Search 未配置。"),
+        )
+    return await service.news_search(
+        arguments["query"], context,
+        max_results=arguments.get("max_results"),
+        time_range=arguments.get("time_range"),
+        start_date=arguments.get("start_date"),
+        end_date=arguments.get("end_date"),
     )
 
 
@@ -330,14 +325,15 @@ async def _github_read_file(context: ToolContext, arguments: dict[str, Any]) -> 
     )
 
 
-async def _fetch_url(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-    return await _cached(
-        "fetch_url",
-        arguments,
-        context,
-        lambda: fetch_web_page(arguments["url"], timeout=_timeout(context)),
-        cache_enabled=False,
-    )
+async def _web_read(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+    service = context.extensions.get("web_research_service")
+    if service is None:
+        return ToolResult(
+            ToolStatus.DATA_UNAVAILABLE,
+            "安全网页读取服务当前不可用。",
+            error=ToolError("web_read_unavailable", "安全网页读取服务当前不可用。"),
+        )
+    return await service.read(arguments["url"], context)
 
 
 async def _run_repository_sync(context: ToolContext, function, /, *args, **kwargs):
@@ -537,11 +533,22 @@ async def _repository_read(context: ToolContext, arguments: dict[str, Any]) -> T
 
 
 async def _web_search(context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
-    return await _cached(
-        "web_search",
-        arguments,
-        context,
-        lambda: search_web(arguments["query"], timeout=_timeout(context)),
+    service = context.extensions.get("web_research_service")
+    if service is None:
+        return ToolResult(
+            ToolStatus.DATA_UNAVAILABLE,
+            "Tavily Web Search 未配置（NOT_CONFIGURED）。",
+            error=ToolError("not_configured", "Tavily Web Search 未配置。"),
+        )
+    return await service.search(
+        arguments["query"], context,
+        max_results=arguments.get("max_results"),
+        search_depth=arguments.get("search_depth"),
+        time_range=arguments.get("time_range"),
+        start_date=arguments.get("start_date"),
+        end_date=arguments.get("end_date"),
+        include_domains=arguments.get("include_domains", ()),
+        exclude_domains=arguments.get("exclude_domains", ()),
     )
 
 
@@ -714,11 +721,10 @@ _HANDLERS: dict[str, tuple[ToolHandler, ToolAccess, tuple[str, ...]]] = {
     "knowledge_search": (_knowledge_search, ToolAccess.LOCAL_READ, ("local_knowledge_index",)),
     "web_search": (_web_search, ToolAccess.NETWORK_READ, ()),
     "news_search": (_news_search, ToolAccess.NETWORK_READ, ()),
-    "multi_search": (_multi_search, ToolAccess.NETWORK_READ, ()),
+    "web_read": (_web_read, ToolAccess.NETWORK_READ, ()),
     "github_repo_search": (_github_repo_search, ToolAccess.NETWORK_READ, ()),
     "github_repo_inspect": (_github_repo_inspect, ToolAccess.NETWORK_READ, ()),
     "github_read_file": (_github_read_file, ToolAccess.NETWORK_READ, ()),
-    "fetch_url": (_fetch_url, ToolAccess.NETWORK_READ, ()),
     "weather": (_weather, ToolAccess.NETWORK_READ, ()),
     "weather_batch": (_weather_batch, ToolAccess.NETWORK_READ, ()),
     "repository_search": (_repository_search, ToolAccess.LOCAL_READ, ("local_git_repository",)),
@@ -748,6 +754,26 @@ def build_legacy_tool_specs(definitions: list[dict[str, Any]]) -> list[ToolSpec]
         if entry is None:
             raise ValueError(f"no legacy handler registered for tool: {name}")
         handler, access, data_requirements = entry
+        if name in {"web_search"}:
+            progress_category = ToolCategory.WEB_SEARCH
+        elif name == "web_read":
+            progress_category = ToolCategory.WEB_READ
+        elif name == "news_search":
+            progress_category = ToolCategory.NEWS_SEARCH
+        elif name in {"knowledge_search", "wiki_search"}:
+            progress_category = ToolCategory.WIKI
+        elif name in {"recipe_lookup"}:
+            progress_category = ToolCategory.RECIPE
+        elif name == "recipe_machine_lookup":
+            progress_category = ToolCategory.MACHINE
+        elif name.startswith(("repository_", "github_")):
+            progress_category = ToolCategory.REPOSITORY
+        elif name in {"sfm_examples", "sfm_generate_validate"}:
+            progress_category = ToolCategory.SFM_VALIDATION
+        elif name.startswith("weather"):
+            progress_category = ToolCategory.WEATHER
+        else:
+            progress_category = ToolCategory.OTHER
         specs.append(
             ToolSpec(
                 name=name,
@@ -771,6 +797,7 @@ def build_legacy_tool_specs(definitions: list[dict[str, Any]]) -> list[ToolSpec]
                 ),
                 output_kind=ToolOutputKind.EVIDENCE,
                 data_requirements=data_requirements,
+                progress_category=progress_category,
             )
         )
     if seen != set(_HANDLERS):

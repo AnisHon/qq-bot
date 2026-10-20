@@ -199,6 +199,22 @@ class Settings:
     reply_notice_delay: float = 3.0
     network_tool_timeout: float = 10.0
     network_proxy_url: str = field(default="", repr=False)
+    tavily_api_key: str = field(default="", repr=False)
+    tavily_search_depth: str = "basic"
+    tavily_max_results: int = 5
+    tavily_timeout_seconds: float = 12.0
+    web_search_max_calls_per_request: int = 3
+    web_extract_max_calls_per_request: int = 3
+    web_search_cache_ttl: int = 1800
+    web_news_cache_ttl: int = 300
+    web_stable_cache_ttl: int = 21600
+    web_release_cache_ttl: int = 600
+    web_extract_cache_ttl: int = 3600
+    web_cache_max_entries: int = 256
+    web_cache_max_bytes: int = 8 * 1024 * 1024
+    web_global_calls_per_minute: int = 60
+    web_max_concurrent_requests: int = 4
+    web_extract_max_chars: int = 12_000
     agent_tools_enabled: bool = True
     agent_tool_max_rounds: int = 8
     agent_tool_max_calls_per_round: int = 10
@@ -370,6 +386,27 @@ class Settings:
             reply_notice_delay=max(0.5, _as_float(os.getenv("REPLY_NOTICE_DELAY"), 3.0)),
             network_tool_timeout=max(3.0, _as_float(os.getenv("NETWORK_TOOL_TIMEOUT"), 10.0)),
             network_proxy_url=os.getenv("NETWORK_PROXY_URL", "").strip(),
+            tavily_api_key=os.getenv("TAVILY_API_KEY", "").strip(),
+            tavily_search_depth=(
+                os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip().casefold()
+                if os.getenv("TAVILY_SEARCH_DEPTH", "basic").strip().casefold()
+                in {"basic", "fast", "advanced", "ultra-fast"}
+                else "basic"
+            ),
+            tavily_max_results=_bounded_int(os.getenv("TAVILY_MAX_RESULTS"), 5, 1, 10),
+            tavily_timeout_seconds=min(30.0, max(3.0, _as_float(os.getenv("TAVILY_TIMEOUT_SECONDS"), 12.0))),
+            web_search_max_calls_per_request=_bounded_int(os.getenv("WEB_SEARCH_MAX_CALLS_PER_REQUEST"), 3, 1, 3),
+            web_extract_max_calls_per_request=_bounded_int(os.getenv("WEB_EXTRACT_MAX_CALLS_PER_REQUEST"), 3, 1, 3),
+            web_search_cache_ttl=_bounded_int(os.getenv("WEB_SEARCH_CACHE_TTL"), 1800, 0, 86_400),
+            web_news_cache_ttl=_bounded_int(os.getenv("WEB_NEWS_CACHE_TTL"), 300, 0, 86_400),
+            web_stable_cache_ttl=_bounded_int(os.getenv("WEB_STABLE_CACHE_TTL"), 21_600, 0, 604_800),
+            web_release_cache_ttl=_bounded_int(os.getenv("WEB_RELEASE_CACHE_TTL"), 600, 0, 86_400),
+            web_extract_cache_ttl=_bounded_int(os.getenv("WEB_EXTRACT_CACHE_TTL"), 3600, 0, 86_400),
+            web_cache_max_entries=_bounded_int(os.getenv("WEB_CACHE_MAX_ENTRIES"), 256, 1, 10_000),
+            web_cache_max_bytes=_bounded_int(os.getenv("WEB_CACHE_MAX_BYTES"), 8 * 1024 * 1024, 1024, 128 * 1024 * 1024),
+            web_global_calls_per_minute=_bounded_int(os.getenv("WEB_GLOBAL_CALLS_PER_MINUTE"), 60, 1, 10_000),
+            web_max_concurrent_requests=_bounded_int(os.getenv("WEB_MAX_CONCURRENT_REQUESTS"), 4, 1, 64),
+            web_extract_max_chars=_bounded_int(os.getenv("WEB_EXTRACT_MAX_CHARS"), 12_000, 1_000, 40_000),
             agent_tools_enabled=_as_bool(os.getenv("AGENT_TOOLS_ENABLED"), True),
             agent_tool_max_rounds=max(0, _as_int(os.getenv("AGENT_TOOL_MAX_ROUNDS"), 8)),
             agent_tool_max_calls_per_round=max(1, _as_int(os.getenv("AGENT_TOOL_MAX_CALLS_PER_ROUND"), 10)),

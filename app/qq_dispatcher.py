@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import StrEnum
 import time
+from typing import AsyncIterator
 
 from app.natcapqq_adapter import NatcapQQAdapter
 from app.text_utils import split_qq_text
+
+
+class DeliveryResult(StrEnum):
+    SENT = "sent"  # Adapter accepted the HTTP action; client display is not confirmed.
+    SUPPRESSED = "suppressed"
 
 
 @dataclass(slots=True)
@@ -52,6 +60,12 @@ class QQMessageDispatcher:
     _recent: dict[tuple[str, str], float] = field(default_factory=dict, init=False)
     _last_status: dict[str, float] = field(default_factory=dict, init=False)
 
+    @asynccontextmanager
+    async def delivery_barrier(self, group_id: str) -> AsyncIterator[None]:
+        """Serialize all outbound messages for a group, including reset fencing."""
+        async with self._locks[str(group_id)]:
+            yield
+
     async def send(
         self,
         group_id: str,
@@ -61,28 +75,42 @@ class QQMessageDispatcher:
         deduplicate: bool = True,
         status: bool = False,
     ) -> bool:
+        async with self.delivery_barrier(group_id):
+            result = await self.send_locked(
+                group_id, text, reply_to=reply_to, deduplicate=deduplicate, status=status
+            )
+        return result == DeliveryResult.SENT
+
+    async def send_locked(
+        self,
+        group_id: str,
+        text: str,
+        *,
+        reply_to: str = "",
+        deduplicate: bool = True,
+        status: bool = False,
+    ) -> DeliveryResult:
+        """Send while the caller holds delivery_barrier(group_id)."""
         cleaned = text.strip()
         if not cleaned:
-            return False
+            return DeliveryResult.SUPPRESSED
         key = (str(group_id), cleaned)
         now = time.monotonic()
         group_key = str(group_id)
         if status and now - self._last_status.get(group_key, -10_000) < self.status_window:
-            return False
+            return DeliveryResult.SUPPRESSED
         if deduplicate and now - self._recent.get(key, -10_000) < self.duplicate_window:
-            return False
+            return DeliveryResult.SUPPRESSED
         if status:
             self._last_status[group_key] = now
         self._recent[key] = now
-
-        async with self._locks[group_key]:
-            parts = split_qq_text(cleaned, self.max_chars)
-            for index, part in enumerate(parts):
-                await self.adapter.send_group_message(
-                    group_id,
-                    part,
-                    reply_to=reply_to if index == 0 else "",
-                )
-                if index < len(parts) - 1:
-                    await asyncio.sleep(self.part_delay)
-        return True
+        parts = split_qq_text(cleaned, self.max_chars)
+        for index, part in enumerate(parts):
+            await self.adapter.send_group_message(
+                group_id,
+                part,
+                reply_to=reply_to if index == 0 else "",
+            )
+            if index < len(parts) - 1:
+                await asyncio.sleep(self.part_delay)
+        return DeliveryResult.SENT

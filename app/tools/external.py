@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 import html as htmlmod
 import json
 import os
@@ -13,7 +12,6 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
-import feedparser
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
@@ -42,15 +40,14 @@ _BROWSER_HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
-# Bing China — fast and accessible on this server through the proxy
-_BING_SEARCH_URL = "https://cn.bing.com/search"
+# Remaining general external client for GitHub metadata and weather endpoints.
 _GITHUB_API = "https://api.github.com"
 _GITHUB_HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": "qq-deepseek-bot/0.2"}
 _GITHUB_TREE_CACHE: dict[str, tuple[float, str, list[dict[str, Any]]]] = {}
 _SAFE_WEB_FETCHER = SafeHTTPFetcher(max_redirects=5, max_response_bytes=1_000_000)
 
 
-def _bing_client(timeout: float) -> httpx.AsyncClient:
+def _external_client(timeout: float) -> httpx.AsyncClient:
     proxy = os.getenv("NETWORK_PROXY_URL", "").strip() or None
     if proxy and not _proxy_is_reachable(proxy):
         proxy = None
@@ -99,93 +96,6 @@ def looks_like_url(text: str) -> bool:
     return True
 
 
-# ── Bing web search ───────────────────────────────────────────────────────────
-
-def _parse_bing_results(html_text: str, max_results: int = 6) -> list[SearchResult]:
-    """Extract organic search results from Bing HTML.
-
-    Results are in <li class="b_algo"> blocks.
-    Title and URL come from the <h2><a href="..."> element.
-    Snippet comes from the first <p> with meaningful text inside the block.
-    """
-    results: list[SearchResult] = []
-    soup = BeautifulSoup(html_text, "html.parser")
-    for block in soup.select("li.b_algo"):
-        anchor = block.select_one("h2 a[href]")
-        if anchor is None:
-            continue
-        url = htmlmod.unescape(str(anchor.get("href") or ""))
-        title = anchor.get_text(" ", strip=True)
-        snippet = ""
-        for paragraph in block.select("p"):
-            candidate = paragraph.get_text(" ", strip=True)
-            if len(candidate) > 20:
-                snippet = candidate
-                break
-
-        if title:
-            results.append(
-                SearchResult(title=title, summary=snippet, url=url, source="Bing搜索")
-            )
-        if len(results) >= max_results:
-            break
-
-    return results
-
-
-async def search_web(query: str, timeout: float = 10.0, max_results: int = 6) -> list[SearchResult]:
-    """Search the web via Bing China (cn.bing.com).
-
-    This server routes traffic through a local HTTP proxy; httpx picks up
-    https_proxy from the environment automatically.
-    """
-    query = query.strip()
-    if not query:
-        return []
-    try:
-        async with _bing_client(timeout) as client:
-            resp = await _get_with_retry(
-                client,
-                _BING_SEARCH_URL,
-                params={"q": query, "setlang": "zh-hans", "mkt": "zh-CN"},
-            )
-            resp.raise_for_status()
-    except httpx.TimeoutException:
-        return [_failed_result("网页搜索", f"Bing搜索超时（>{timeout:.0f}s）。")]
-    except Exception as exc:  # noqa: BLE001
-        return [_failed_result("网页搜索", f"Bing搜索失败：{exc}")]
-
-    results = _parse_bing_results(resp.text, max_results=max_results)
-    if not results:
-        return [_failed_result("网页搜索", "Bing搜索未找到结果，可能触发了验证码，稍后重试。")]
-    return results
-
-
-async def multi_search(queries: list[str], timeout: float = 10.0, max_results: int = 10) -> list[SearchResult]:
-    """Run several independently phrased searches concurrently and de-duplicate results."""
-    cleaned = list(dict.fromkeys(query.strip() for query in queries if query.strip()))[:6]
-    if not cleaned:
-        return []
-    batches = await __import__("asyncio").gather(
-        *[search_web(query, timeout=timeout, max_results=6) for query in cleaned],
-        return_exceptions=True,
-    )
-    merged: list[SearchResult] = []
-    seen: set[str] = set()
-    for batch in batches:
-        if isinstance(batch, Exception):
-            continue
-        for result in batch:
-            key = result.url or f"{result.title}:{result.summary}"
-            if key in seen:
-                continue
-            seen.add(key)
-            merged.append(result)
-            if len(merged) >= max_results:
-                return merged
-    return merged
-
-
 async def search_github_repositories(query: str, timeout: float = 12.0, max_results: int = 6) -> list[SearchResult]:
     query = query.strip()
     if not query:
@@ -205,7 +115,7 @@ async def search_github_repositories(query: str, timeout: float = 12.0, max_resu
         variants.insert(0, f"AllTheMods ATM-{atm_match.group(1)} in:name")
     variants = list(dict.fromkeys(variants))[:3]
     try:
-        async with _bing_client(timeout) as client:
+        async with _external_client(timeout) as client:
             import asyncio
             responses = await asyncio.gather(
                 *[
@@ -355,7 +265,7 @@ async def _github_tree(repository: str, timeout: float) -> tuple[str, list[dict[
         branch, tree = _local_github_tree(local_dir)
     else:
         try:
-            async with _bing_client(timeout) as client:
+            async with _external_client(timeout) as client:
                 repo_resp = await client.get(f"{_GITHUB_API}/repos/{repository}", headers=_github_headers())
                 repo_resp.raise_for_status()
                 branch = str(repo_resp.json().get("default_branch") or "main")
@@ -377,7 +287,7 @@ async def _github_raw_file(repository: str, branch: str, path: str, timeout: flo
     local_file = _github_local_dir(repository) / path
     if local_file.is_file():
         return local_file.read_text(encoding="utf-8", errors="replace")
-    async with _bing_client(timeout) as client:
+    async with _external_client(timeout) as client:
         resp = await client.get(f"https://raw.githubusercontent.com/{repository}/{branch}/{path}")
         resp.raise_for_status()
         return resp.text
@@ -543,129 +453,6 @@ def _kubejs_recipe_facts(text: str, exact_term: str) -> list[str]:
     return facts
 
 
-async def search_news(query: str, timeout: float = 10.0, max_results: int = 6) -> list[SearchResult]:
-    """Search current news, preferring Bing News RSS with publication dates."""
-    query = query.strip() or "今日新闻"
-    now = datetime.now()
-    today = f"{now.year}年{now.month}月{now.day}日"
-    generic = _is_generic_news_query(query)
-    topic = re.sub(r"(?:今天|今日|最近|最新|有什么|新闻|热点|要闻)", " ", query)
-    topic = re.sub(r"\s+", " ", topic).strip()
-    rss_query = topic or "中国 国内 国际"
-    rss_results = await _fetch_news_rss(rss_query, timeout, max_results)
-    if rss_results:
-        return rss_results
-    if generic:
-        news_query = f'新闻 国内 国际 after:{now:%Y-%m-%d}'
-    elif today not in query:
-        news_query = f'{topic or query} 新闻 after:{now:%Y-%m-%d}'
-    else:
-        news_query = f"{query} 最新消息"
-    if generic:
-        cnr_results = await _fetch_cnr_latest(timeout=timeout, max_results=max_results)
-        if cnr_results:
-            return cnr_results
-
-    results = await search_web(news_query, timeout=timeout, max_results=max_results)
-    # Re-tag source for caller context
-    return [
-        SearchResult(title=r.title, summary=r.summary, url=r.url, source="新闻搜索")
-        for r in results
-    ]
-
-
-async def _fetch_news_rss(query: str, timeout: float, max_results: int) -> list[SearchResult]:
-    try:
-        async with _bing_client(timeout) as client:
-            resp = await _get_with_retry(
-                client,
-                "https://news.google.com/rss/search",
-                params={
-                    "q": f"{query} when:1d",
-                    "hl": "zh-CN",
-                    "gl": "CN",
-                    "ceid": "CN:zh-Hans",
-                },
-            )
-        resp.raise_for_status()
-        feed = feedparser.parse(resp.content)
-    except Exception:  # noqa: BLE001
-        return []
-
-    results: list[SearchResult] = []
-    for item in feed.entries:
-        title = str(item.get("title") or "").strip()
-        url = str(item.get("link") or "").strip()
-        summary = _clean_html(str(item.get("summary") or ""))
-        published = str(item.get("published") or "").strip()
-        if not title or not url:
-            continue
-        if published:
-            summary = f"发布时间：{published}。{summary}"
-        results.append(SearchResult(title, summary, url, "Google新闻"))
-        if len(results) >= max_results:
-            break
-    return results
-
-
-def _is_generic_news_query(query: str) -> bool:
-    normalized = re.sub(r"\d{4}年\s*\d{1,2}月\s*\d{1,2}日", "", query)
-    normalized = re.sub(r"[\s，,。.!！?？]", "", normalized)
-    return normalized in {
-        "新闻",
-        "今日新闻",
-        "今天新闻",
-        "最近新闻",
-        "最新新闻",
-        "热点新闻",
-        "新闻热点",
-        "今天有什么新闻",
-        "今日有什么新闻",
-        "最近有什么新闻",
-        "最新有什么新闻",
-        "今日要闻",
-        "今天要闻",
-    }
-
-
-async def _fetch_cnr_latest(timeout: float, max_results: int) -> list[SearchResult]:
-    """Read concrete, timestamped stories from CNR's rolling-news page."""
-    try:
-        async with _bing_client(timeout) as client:
-            resp = await client.get("https://news.cnr.cn/kuaixun/")
-            resp.raise_for_status()
-        page = resp.content.decode("gb18030", errors="replace")
-    except Exception as exc:  # noqa: BLE001
-        # Bing remains the fallback, so a source-specific failure is non-fatal.
-        return []
-
-    results: list[SearchResult] = []
-    blocks = re.findall(r'<div class="item[^>]*>(.*?)</div>', page, re.DOTALL)
-    for block in blocks:
-        url_match = re.search(r'<a href="(https?://[^"]+)"', block)
-        title_match = re.search(r"<strong>(.*?)</strong>", block, re.DOTALL)
-        summary_match = re.search(r"<em>(.*?)</em>", block, re.DOTALL)
-        time_match = re.search(r'<span class="publishTime">(.*?)</span>', block, re.DOTALL)
-        if not url_match or not title_match:
-            continue
-        title = _clean_html(title_match.group(1))
-        summary = _clean_html(summary_match.group(1)) if summary_match else ""
-        published = _clean_html(time_match.group(1)) if time_match else ""
-        if published:
-            summary = f"发布时间：{published}。{summary}"
-        results.append(
-            SearchResult(
-                title=title,
-                summary=summary,
-                url=htmlmod.unescape(url_match.group(1)),
-                source="央广网滚动新闻",
-            )
-        )
-        if len(results) >= max_results:
-            break
-    return results
-
-
 # ── Webpage fetch ─────────────────────────────────────────────────────────────
 
 async def fetch_web_page(url: str, timeout: float = 15.0) -> list[SearchResult]:
@@ -740,7 +527,7 @@ async def get_weather(location: str, timeout: float = 10.0) -> list[SearchResult
     """Get current weather using Open-Meteo geocoding and forecast APIs."""
     location = location.strip() or "当前地区"
     try:
-        async with _bing_client(timeout) as client:
+        async with _external_client(timeout) as client:
             geo_resp = await _get_with_retry(
                 client,
                 "https://geocoding-api.open-meteo.com/v1/search",
@@ -802,7 +589,7 @@ async def get_weather(location: str, timeout: float = 10.0) -> list[SearchResult
 async def _get_weather_via_wttr(location: str, timeout: float, primary_error: str) -> list[SearchResult]:
     """Fallback weather source used when either Open-Meteo endpoint is unavailable."""
     try:
-        async with _bing_client(timeout) as client:
+        async with _external_client(timeout) as client:
             response = await _get_with_retry(
                 client,
                 f"https://wttr.in/{location}",

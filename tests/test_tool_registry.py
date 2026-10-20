@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from unittest import IsolatedAsyncioTestCase, TestCase
 
@@ -20,6 +19,13 @@ from app.tools.contracts import (
     tool_result_to_search_results,
 )
 from app.tools.registry import ToolRegistry
+from app.progress.events import (
+    AgentEventKind,
+    RequestAgentEventSink,
+    TaskIdentity,
+    ToolCategory,
+    ToolOutcome,
+)
 from app.usage_budget import BudgetScope, ToolUsage
 
 
@@ -35,27 +41,23 @@ def group_context(request_id: str, **kwargs) -> ToolContext:
 
 
 class ToolRegistrySchemaTest(TestCase):
-    def test_legacy_openai_schema_snapshot_is_unchanged(self) -> None:
+    def test_openai_schema_contains_single_tavily_search_and_web_read_tools(self) -> None:
         schemas = TOOL_REGISTRY.openai_schemas()
-        old_schemas = schemas[:10]
-        serialized = json.dumps(old_schemas, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        self.assertEqual(len(schemas), 17)
-        self.assertEqual(
-            {schema["function"]["name"] for schema in schemas[10:]},
-            {
-                "repository_search",
-                "repository_read",
-                "recipe_lookup",
-                "recipe_machine_lookup",
-                "sfm_examples",
-                "sfm_generate_validate",
-                "task_evidence_read",
-            },
-        )
-        self.assertEqual(
-            hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
-            "bcd6ed210d8615e1f0e91323c4eaefbb58085d3588d1ea2afd2465c1d47676ea",
-        )
+        names = {schema["function"]["name"] for schema in schemas}
+        self.assertEqual(len(schemas), 16)
+        self.assertIn("web_search", names)
+        self.assertIn("news_search", names)
+        self.assertIn("web_read", names)
+        self.assertNotIn("multi_search", names)
+        self.assertNotIn("fetch_url", names)
+        for name in ("web_search", "news_search", "web_read"):
+            self.assertEqual(sum(schema["function"]["name"] == name for schema in schemas), 1)
+        search_schema = next(schema["function"]["parameters"] for schema in schemas if schema["function"]["name"] == "web_search")
+        self.assertEqual(search_schema["properties"]["search_depth"]["enum"], ["basic", "fast", "advanced", "ultra-fast"])
+        self.assertIn("start_date", search_schema["properties"])
+        self.assertIn("end_date", search_schema["properties"])
+        self.assertEqual(search_schema["properties"]["exclude_domains"]["maxItems"], 10)
+        self.assertFalse(search_schema["properties"].get("include_answer"))
 
     def test_duplicate_names_and_frozen_registry_are_rejected(self) -> None:
         async def handler(context, arguments):
@@ -130,6 +132,102 @@ class ToolRegistryDispatchTest(IsolatedAsyncioTestCase):
         self.assertEqual(result.content, {"query": "find"})
         self.assertEqual(seen, [(budget_scope, controller, {"query": "find", "tags": ["a"]})])
         self.assertEqual(registry.openai_schemas()[0]["function"]["name"], "lookup")
+
+    async def test_tool_lifecycle_events_follow_real_handler_boundary_and_limited_result(self) -> None:
+        events = []
+        identity = TaskIdentity.create(
+            request_id="r-event", group_id="g1", user_id="u1", epoch=0, origin="user_message"
+        )
+
+        async def handler(_context, _arguments):
+            return ToolResult(
+                ToolStatus.OK,
+                "ok",
+                evidence=(
+                    Evidence("web", "source-1", "first", "https://example.test/1"),
+                    Evidence("web", "source-2", "second", "https://example.test/2"),
+                ),
+            )
+
+        registry = ToolRegistry([ToolSpec(
+            "lookup", "lookup", {"type": "object"}, handler, policy=GROUP_POLICY,
+            progress_category=ToolCategory.WEB_SEARCH,
+        )])
+        context = group_context(
+            "r-event",
+            task_identity=identity,
+            event_sink=RequestAgentEventSink(identity, events.append),
+            tool_call_id="call-1",
+            evidence_limit=1,
+        )
+        result = await registry.dispatch("lookup", "{}", context)
+        self.assertEqual(result.status, ToolStatus.PARTIAL)
+        self.assertEqual(len(result.evidence), 1)
+        self.assertEqual([event.kind for event in events], [
+            AgentEventKind.TOOL_STARTED, AgentEventKind.TOOL_COMPLETED,
+        ])
+        self.assertEqual(events[0].payload.category, ToolCategory.WEB_SEARCH)
+        self.assertEqual(events[1].payload.outcome, ToolOutcome.PARTIAL)
+        self.assertEqual(events[1].payload.evidence_count, 1)
+        self.assertEqual(events[1].tool_call_id, "call-1")
+
+    async def test_rejected_tool_never_emits_started(self) -> None:
+        events = []
+        identity = TaskIdentity.create(
+            request_id="r-denied", group_id="g1", user_id="u1", epoch=0, origin="user_message"
+        )
+
+        async def handler(_context, _arguments):
+            self.fail("denied handler must not execute")
+
+        registry = ToolRegistry([ToolSpec(
+            "restricted", "restricted", {"type": "object"}, handler,
+            policy=ToolPolicy(required_permissions=frozenset({"special"})),
+            progress_category=ToolCategory.REPOSITORY,
+        )])
+        context = ToolContext(
+            request_id="r-denied",
+            task_identity=identity,
+            event_sink=RequestAgentEventSink(identity, events.append),
+        )
+        result = await registry.dispatch("restricted", "{}", context)
+        self.assertEqual(result.status, ToolStatus.DENIED)
+        self.assertEqual([event.kind for event in events], [AgentEventKind.TOOL_REJECTED])
+        self.assertEqual(events[0].payload.outcome, ToolOutcome.DENIED)
+        self.assertFalse(events[0].payload.execution_started)
+
+    async def test_waiting_for_semaphore_cancelled_call_is_not_reported_started(self) -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        events = []
+        identity = TaskIdentity.create(
+            request_id="r-cancel", group_id="g1", user_id="u1", epoch=0, origin="user_message"
+        )
+
+        async def handler(_context, _arguments):
+            entered.set()
+            await release.wait()
+            return ToolResult(ToolStatus.OK, "ok")
+
+        registry = ToolRegistry([ToolSpec(
+            "lookup", "lookup", {"type": "object"}, handler, policy=GROUP_POLICY,
+            max_concurrency=1,
+        )])
+        sink = RequestAgentEventSink(identity, events.append)
+        first_context = group_context("r-cancel", task_identity=identity, event_sink=sink, tool_call_id="first")
+        second_context = group_context("r-cancel", task_identity=identity, event_sink=sink, tool_call_id="second")
+        first = asyncio.create_task(registry.dispatch("lookup", "{}", first_context))
+        await entered.wait()
+        second = asyncio.create_task(registry.dispatch("lookup", "{}", second_context))
+        await asyncio.sleep(0)
+        second.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await second
+        release.set()
+        await first
+        second_events = [event for event in events if event.tool_call_id == "second"]
+        self.assertEqual([event.kind for event in second_events], [AgentEventKind.TOOL_CANCELLED])
+        self.assertFalse(second_events[0].payload.execution_started)
 
     async def test_argument_validator_can_normalize_legacy_alias_before_schema_check(self) -> None:
         received: list[dict] = []

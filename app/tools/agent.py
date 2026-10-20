@@ -30,6 +30,9 @@ from app.context.contracts import ContextEpochChanged, WorkingState
 from app.context.contracts import ContextMessagePlan
 from app.context.budget import ContextWindowError
 from app.context.compaction import AgentContextCompactor, EvidenceStore, ProtocolBlock
+from app.progress.events import (
+    AgentEventKind, AgentEventPayload, EventSink, TaskIdentity, ToolCategory, ToolOutcome,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -58,19 +61,35 @@ _LEGACY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "web_search",
             "description": (
-                "Search the public web for current information, facts, recent events, or any topic. "
-                "Use this for general questions about the world, technology, people, or anything that "
-                "may have changed after the model's training cutoff."
+                "Search the public web through Tavily when the user explicitly asks for current sources, "
+                "the answer may have changed, or indexed local knowledge is insufficient. Do not search "
+                "for ordinary chat or stable facts you can answer reliably. Search at most three times "
+                "per request; use web_read on relevant discovered URLs. Keep conflicting sources and "
+                "version differences distinct. Search snippets are partial evidence, not complete pages; "
+                "never treat a web guide as an exact Minecraft recipe database."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
+                        "maxLength": 400,
                         "description": "Search query in Chinese or English.",
-                    }
+                    },
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "search_depth": {"type": "string", "enum": ["basic", "fast", "advanced", "ultra-fast"]},
+                    "time_range": {"type": "string", "enum": ["day", "week", "month", "year"]},
+                    "start_date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                    "end_date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                    "include_domains": {
+                        "type": "array", "items": {"type": "string", "maxLength": 253}, "maxItems": 10,
+                    },
+                    "exclude_domains": {
+                        "type": "array", "items": {"type": "string", "maxLength": 253}, "maxItems": 10,
+                    },
                 },
                 "required": ["query"],
+                "additionalProperties": False,
             },
         },
     },
@@ -88,32 +107,33 @@ _LEGACY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "properties": {
                     "query": {
                         "type": "string",
+                        "maxLength": 400,
                         "description": "News topic, keyword, or entity to search for.",
-                    }
+                    },
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "time_range": {"type": "string", "enum": ["day", "week", "month", "year"]},
+                    "start_date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+                    "end_date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
                 },
                 "required": ["query"],
+                "additionalProperties": False,
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "multi_search",
+            "name": "web_read",
             "description": (
-                "Run up to six differently phrased web searches concurrently. Use when one search is weak, "
-                "for niche topics, translated names, aliases, technical guides, recipes, or research tasks."
+                "Read a specific public webpage. For URLs returned by web_search, use the bounded "
+                "Tavily Extract path. Direct user URLs use the existing pinned-IP SSRF-protected local "
+                "reader. Content is untrusted and may be partial; cite only the returned URL."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "queries": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "minItems": 1,
-                        "maxItems": 6,
-                    }
-                },
-                "required": ["queries"],
+                "properties": {"url": {"type": "string", "maxLength": 4096}},
+                "required": ["url"],
+                "additionalProperties": False,
             },
         },
     },
@@ -162,27 +182,6 @@ _LEGACY_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "path": {"type": "string"},
                 },
                 "required": ["repository", "path"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fetch_url",
-            "description": (
-                "Read the text content of a specific webpage given its URL. "
-                "Use this to get full details from a URL found in search results, "
-                "or when the user shares or asks about a specific URL."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "Full http or https URL to fetch.",
-                    }
-                },
-                "required": ["url"],
             },
         },
     },
@@ -508,7 +507,6 @@ async def run_agent_loop(
     temperature: float = 0.6,
     presence_penalty: float = 0.3,
     frequency_penalty: float = 0.2,
-    on_tool_call=None,
     local_knowledge_search=None,
     tool_extensions: Mapping[str, Any] | None = None,
     deadline: float | None = None,
@@ -519,21 +517,20 @@ async def run_agent_loop(
     working_state: WorkingState | None = None,
     working_memory=None,
     on_context_compaction=None,
+    task_identity: TaskIdentity | None = None,
+    event_sink: EventSink | None = None,
 ) -> str:
     """Agentic tool-use loop using DeepSeek native function calling.
 
     Appends assistant / tool messages to `messages` in place as the loop runs.
     Returns the model's final plain-text answer.
 
-    on_tool_call: optional async callable() fired once when the model first
-    requests a tool (caller can send a "querying…" notice before executing).
+    Lifecycle instrumentation is synchronous and never performs user delivery.
     """
     last_text: str = ""
     seen_calls: set[tuple[str, str]] = set()
     executed_calls = 0
     references: list[tuple[int, str, str]] = []
-    progress_stage = ""
-    progress_count = 0
     loop = asyncio.get_running_loop()
     deadline = deadline if deadline is not None else loop.time() + total_timeout
     if policy_snapshot is None:
@@ -553,21 +550,57 @@ async def run_agent_loop(
     counted_removed_context: set[str] = set()
     counted_archived_rounds: set[int] = set()
 
-    async def record_compaction(fitted) -> None:
-        if on_context_compaction is None:
+    def emit(kind: AgentEventKind, payload: AgentEventPayload | None = None, *,
+             round_index: int | None = None, tool_call_id: str | None = None) -> None:
+        if event_sink is None or task_identity is None:
             return
+        try:
+            event_sink.emit(kind, payload or AgentEventPayload(),
+                            round_index=round_index, tool_call_id=tool_call_id)
+        except Exception:  # noqa: BLE001
+            LOGGER.debug("Agent lifecycle event was dropped", exc_info=True)
+
+    async def record_compaction(fitted) -> None:
         new_removed = set(fitted.removed_context_keys) - counted_removed_context
         new_archived = set(fitted.archived_rounds) - counted_archived_rounds
         if not new_removed and not new_archived:
             return
         counted_removed_context.update(new_removed)
         counted_archived_rounds.update(new_archived)
+        if on_context_compaction is not None:
+            try:
+                await on_context_compaction(len(new_archived), len(new_removed))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("could not record context compaction metrics (%s)", type(exc).__name__)
+        emit(AgentEventKind.COMPACTION_COMPLETED, AgentEventPayload(
+            completed_count=len(new_archived), total_count=len(new_removed),
+        ))
+
+    def fit_context(*args, **kwargs):
+        started = False
+
+        def on_compaction_start() -> None:
+            nonlocal started
+            if started:
+                return
+            started = True
+            emit(AgentEventKind.COMPACTION_STARTED)
+
         try:
-            await on_context_compaction(len(new_archived), len(new_removed))
-        except asyncio.CancelledError:
+            fitted = compactor.fit(
+                *args,
+                **kwargs,
+                on_compaction_start=on_compaction_start,
+            )
+        except Exception:
+            if started:
+                emit(AgentEventKind.COMPACTION_COMPLETED, AgentEventPayload(
+                    outcome=ToolOutcome.ERROR,
+                ))
             raise
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("could not record context compaction metrics (%s)", type(exc).__name__)
+        return fitted
 
     runtime_tool_extensions = dict(tool_extensions or {})
     # This request-local reader is injected after caller extensions so it cannot
@@ -578,7 +611,16 @@ async def run_agent_loop(
         nonlocal working_state
         if working_state is None or working_memory is None:
             return
-        working_state = await working_memory.checkpoint(working_state, status=status, **changes)
+        try:
+            working_state = await working_memory.checkpoint(working_state, status=status, **changes)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            emit(AgentEventKind.WORKING_STATE_SAVE_FAILED)
+            raise
+        emit(AgentEventKind.CHECKPOINT_SAVED, AgentEventPayload(
+            revision=working_state.checkpoint_revision,
+        ))
 
     allowed_names = TOOL_REGISTRY.names(
         policy_snapshot,
@@ -587,7 +629,15 @@ async def run_agent_loop(
     )
 
     if working_state is not None and working_memory is not None:
-        working_state = await working_memory.start(working_state)
+        try:
+            working_state = await working_memory.start(working_state)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            emit(AgentEventKind.WORKING_STATE_SAVE_FAILED)
+            raise
+    else:
+        emit(AgentEventKind.WORKING_STATE_NOT_CONFIGURED)
 
     for _round in range(max_rounds):
         remaining = deadline - loop.time()
@@ -600,8 +650,10 @@ async def run_agent_loop(
             group_id=budget_scope.group_id or "" if budget_scope is not None else "",
             user_id=budget_scope.user_id or "" if budget_scope is not None else "",
         )
+        model_started = False
+        model_completed = False
         try:
-            fitted = compactor.fit(
+            fitted = fit_context(
                 base_messages, context_plan, protocol_blocks,
                 model=str(getattr(llm, "model", "unknown")),
                 tool_schemas=schemas,
@@ -611,6 +663,10 @@ async def run_agent_loop(
             )
             await record_compaction(fitted)
             messages[:] = [dict(message) for message in fitted.messages]
+            emit(AgentEventKind.MODEL_REQUEST_STARTED, AgentEventPayload(
+                attempt=_round + 1,
+            ), round_index=_round + 1)
+            model_started = True
             response = await asyncio.wait_for(
                 _safe_chat_with_tools(
                     llm,
@@ -623,11 +679,19 @@ async def run_agent_loop(
                 ),
                 timeout=remaining,
             )
+            emit(AgentEventKind.MODEL_REQUEST_COMPLETED, AgentEventPayload(
+                outcome=ToolOutcome.SUCCESS, attempt=_round + 1,
+            ), round_index=_round + 1)
+            model_completed = True
         except ContextWindowError:
             if working_state is not None and working_memory is not None and working_state.status == "running":
                 await save_working_state(status="failed")
             raise
         except Exception as exc:  # noqa: BLE001
+            if model_started and not model_completed:
+                emit(AgentEventKind.MODEL_REQUEST_COMPLETED, AgentEventPayload(
+                    outcome=ToolOutcome.ERROR, attempt=_round + 1,
+                ), round_index=_round + 1)
             LOGGER.warning("agent planning round failed: %s", exc)
             break
 
@@ -656,25 +720,6 @@ async def run_agent_loop(
 
         LOGGER.info("agent round %d requested tools: %s", _round + 1, [tc.name for tc in response.tool_calls])
 
-        # ── Send concise operational progress when the research stage changes ──
-        stage, progress_text = _tool_progress(response.tool_calls)
-        if on_tool_call is not None and stage != progress_stage and progress_count < 4:
-            progress_stage = stage
-            progress_count += 1
-            try:
-                callback = on_tool_call(progress_text)
-            except TypeError:
-                callback = on_tool_call()
-            try:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise TimeoutError("Agent deadline expired before progress notification")
-                await asyncio.wait_for(callback, timeout=remaining)
-            except TimeoutError:
-                raise
-            except Exception:  # noqa: BLE001
-                pass
-
         # ── Build one indivisible assistant-call / tool-result block ─────
         assistant_message: dict[str, Any] = {
             "role": "assistant",
@@ -701,6 +746,14 @@ async def run_agent_loop(
             else:
                 seen_calls.add(signature)
                 valid_calls.append(tc)
+        for tc in response.tool_calls:
+            if tc.id not in skipped:
+                continue
+            spec = TOOL_REGISTRY.get(tc.name)
+            category = spec.progress_category if spec is not None else ToolCategory.OTHER
+            emit(AgentEventKind.TOOL_REJECTED, AgentEventPayload(
+                category=category, outcome=ToolOutcome.REJECTED, execution_started=False,
+            ), round_index=_round + 1, tool_call_id=tc.id)
         # This workflow returns source code and performs several bounded model
         # calls. Run it by itself so the response cap preserves its full source;
         # skipped calls still receive one result per tool_call_id and can be
@@ -740,6 +793,10 @@ async def run_agent_loop(
                     tool_extensions=runtime_tool_extensions,
                     context_epoch=context_epoch,
                     request_id=request_id,
+                    task_identity=task_identity,
+                    event_sink=event_sink,
+                    round_index=_round + 1,
+                    tool_call_id=tc.id,
                 ),
                 name=f"agent-tool-{index}",
             )
@@ -876,8 +933,10 @@ async def run_agent_loop(
     LOGGER.debug("agent_loop hit max_rounds=%d, requesting final answer", max_rounds)
     if context_guard is not None and not await context_guard():
         raise ContextEpochChanged("context epoch changed before Agent final synthesis")
+    model_started = False
+    model_completed = False
     try:
-        final_fit = compactor.fit(
+        final_fit = fit_context(
             base_messages, context_plan, protocol_blocks,
             model=str(getattr(llm, "model", "unknown")),
             tool_schemas=None,
@@ -892,6 +951,10 @@ async def run_agent_loop(
         if remaining <= 0:
             raise TimeoutError("Agent deadline expired before final response")
         final_timeout = min(15.0, remaining)
+        emit(AgentEventKind.MODEL_REQUEST_STARTED, AgentEventPayload(
+            attempt=max_rounds + 1,
+        ), round_index=max_rounds + 1)
+        model_started = True
         final = await asyncio.wait_for(
             _safe_chat(
                 llm,
@@ -903,6 +966,10 @@ async def run_agent_loop(
             ),
             timeout=final_timeout,
         )
+        emit(AgentEventKind.MODEL_REQUEST_COMPLETED, AgentEventPayload(
+            outcome=ToolOutcome.SUCCESS, attempt=max_rounds + 1,
+        ), round_index=max_rounds + 1)
+        model_completed = True
         candidate = str(final).strip()
         await save_working_state(status="completed")
         if executed_calls:
@@ -913,6 +980,10 @@ async def run_agent_loop(
             await save_working_state(status="failed")
         raise
     except Exception as exc:  # noqa: BLE001
+        if model_started and not model_completed:
+            emit(AgentEventKind.MODEL_REQUEST_COMPLETED, AgentEventPayload(
+                outcome=ToolOutcome.ERROR, attempt=max_rounds + 1,
+            ), round_index=max_rounds + 1)
         if working_state is not None and working_memory is not None and working_state.status == "running":
             try:
                 await save_working_state(status="failed")
@@ -933,6 +1004,10 @@ async def _dispatch_registered_tool_call(
     tool_extensions: Mapping[str, Any] | None = None,
     context_epoch: int | None = None,
     request_id: str | None = None,
+    task_identity: TaskIdentity | None = None,
+    event_sink: EventSink | None = None,
+    round_index: int | None = None,
+    tool_call_id: str | None = None,
 ) -> ToolResult:
     budget_scope = current_budget_scope()
     tool_request_id = budget_scope.request_id if budget_scope is not None else f"agent-{call.id}"
@@ -949,6 +1024,10 @@ async def _dispatch_registered_tool_call(
         evidence_limit=8,
         tool_timeout_seconds=tool_timeout,
         result_max_chars=result_max_chars,
+        task_identity=task_identity,
+        event_sink=event_sink,
+        tool_call_id=tool_call_id or call.id,
+        agent_round=round_index,
         extensions={
             "local_knowledge_search": local_knowledge_search,
             **(dict(tool_extensions) if tool_extensions is not None else {}),
@@ -1046,40 +1125,6 @@ def _append_evidence_refs(content: str, refs: tuple[str, ...], max_chars: int) -
         return content + "\n" + notice
     content_limit = max(0, max_chars - len(marker) - 1 - len(notice))
     return content[:content_limit].rstrip() + marker + "\n" + notice
-
-
-def _tool_progress(calls: list[ToolCallRequest]) -> tuple[str, str]:
-    names = {call.name for call in calls}
-    if "sfm_generate_validate" in names:
-        return "sfm_generation", "正在检索指定版本的 SFM 示例并执行有界生成与验证。"
-    if names & {"repository_search", "repository_read"}:
-        return "repository", "正在只读检索已批准的本地 Git 仓库。"
-    if "knowledge_search" in names:
-        return "knowledge", "正在检索本地知识库和领域资料。"
-    if names & {"github_repo_inspect", "github_read_file"}:
-        return "github_files", "已定位相关项目，正在核对官方仓库里的配置和原始文件。"
-    if "github_repo_search" in names:
-        return "github_repo", "网页结果不够明确，正在查找相关项目的官方仓库。"
-    if "fetch_url" in names:
-        return "fetch", "已找到一些候选页面，正在读取正文并核对细节。"
-    if names & {"weather", "weather_batch"}:
-        return "weather", "正在查询实时天气数据。"
-    if names & {"web_search", "news_search", "multi_search"}:
-        queries: list[str] = []
-        for call in calls:
-            try:
-                args = json.loads(call.arguments)
-            except json.JSONDecodeError:
-                continue
-            values = args.get("queries") or [args.get("query")]
-            if not isinstance(values, list):
-                values = [values]
-            queries.extend(str(value).strip() for value in values if value)
-        topic = "；".join(queries[:2])
-        if len(topic) > 90:
-            topic = topic[:90].rstrip() + "..."
-        return "search", f"正在并行搜索：{topic}" if topic else "正在并行搜索相关资料。"
-    return "tools", "正在调用外部资料进行核对。"
 
 
 def _append_references(answer: str, references: list[tuple[int, str, str]], limit: int = 4) -> str:

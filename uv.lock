@@ -566,18 +566,6 @@ wheels = [
 ]
 
 [[package]]
-name = "feedparser"
-version = "6.0.12"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-dependencies = [
-    { name = "sgmllib3k" },
-]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/dc/79/db7edb5e77d6dfbc54d7d9df72828be4318275b2e580549ff45a962f6461/feedparser-6.0.12.tar.gz", hash = "sha256:64f76ce90ae3e8ef5d1ede0f8d3b50ce26bcce71dd8ae5e82b1cd2d4a5f94228", size = 286579, upload-time = "2025-09-10T13:33:59.486Z" }
-wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/4e/eb/c96d64137e29ae17d83ad2552470bafe3a7a915e85434d9942077d7fd011/feedparser-6.0.12-py3-none-any.whl", hash = "sha256:6bbff10f5a52662c00a2e3f86a38928c37c48f77b3c511aedcd51de933549324", size = 81480, upload-time = "2025-09-10T13:33:58.022Z" },
-]
-
-[[package]]
 name = "filelock"
 version = "3.32.3"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -2132,7 +2120,6 @@ dependencies = [
     { name = "beautifulsoup4" },
     { name = "chromadb" },
     { name = "fastapi" },
-    { name = "feedparser" },
     { name = "httpx", extra = ["socks"] },
     { name = "pypdf" },
     { name = "sentence-transformers" },
@@ -2145,7 +2132,6 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12.0" },
     { name = "chromadb", specifier = ">=0.5" },
     { name = "fastapi", specifier = ">=0.115.0" },
-    { name = "feedparser", specifier = ">=6.0.11" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.27.0" },
     { name = "pypdf", specifier = ">=4.0.0" },
     { name = "sentence-transformers", specifier = ">=3.0" },
@@ -2537,12 +2523,6 @@ sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/6d/44/f5da03a8ef95d3
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/setuptools-84.0.0-py3-none-any.whl", hash = "sha256:51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670", size = 818216, upload-time = "2026-08-08T18:27:56.719Z" },
 ]
-
-[[package]]
-name = "sgmllib3k"
-version = "1.0.0"
-source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/9e/bd/3704a8c3e0942d711c1299ebf7b9091930adae6675d7c8f476a7ce48653c/sgmllib3k-1.0.0.tar.gz", hash = "sha256:7868fb1c8bfa764c1ac563d3cf369c381d1325d36124933a726f29fcdaa812e9", size = 5750, upload-time = "2010-08-24T14:33:52.445Z" }
 
 [[package]]
 name = "shellingham"

@@ -27,6 +27,11 @@ from app.tools.agent import (
 )
 from app.tools.contracts import ToolContext, ToolError, ToolResult, ToolStatus, search_results_to_tool_result
 from app.tools.policies import group_member_policy_snapshot
+from app.tools.web_research import TavilySearchProvider, WebResearchService, WebResponseCache
+from app.progress.events import (
+    AgentEventKind, AgentEventPayload, EventSink, RequestAgentEventSink,
+    TaskIdentity, ToolOutcome,
+)
 from app.tools.minecraft_wiki import search_minecraft_wiki
 from app.tools.mcbaike import search_mcbaike
 from app.repositories.local_git import LocalGitRepositoryService
@@ -336,6 +341,24 @@ class LLMHandler:
         self.recipe_query_service = RecipeQueryService(RecipeRepository(settings.sqlite_path))
         self.sfm_knowledge_service = SFMKnowledgeService(self.document_knowledge)
         self.sfm_validation_service = SFMValidationService()
+        self.web_research_service = WebResearchService(
+            TavilySearchProvider(settings.tavily_api_key),
+            configured=bool(settings.tavily_api_key),
+            search_depth=settings.tavily_search_depth,
+            max_results=settings.tavily_max_results,
+            timeout_seconds=settings.tavily_timeout_seconds,
+            max_search_calls_per_request=settings.web_search_max_calls_per_request,
+            max_extract_calls_per_request=settings.web_extract_max_calls_per_request,
+            generic_cache_ttl=settings.web_search_cache_ttl,
+            news_cache_ttl=settings.web_news_cache_ttl,
+            stable_cache_ttl=settings.web_stable_cache_ttl,
+            release_cache_ttl=settings.web_release_cache_ttl,
+            extract_cache_ttl=settings.web_extract_cache_ttl,
+            cache=WebResponseCache(settings.web_cache_max_entries, settings.web_cache_max_bytes),
+            global_calls_per_minute=settings.web_global_calls_per_minute,
+            max_concurrent_requests=settings.web_max_concurrent_requests,
+            extract_max_chars=settings.web_extract_max_chars,
+        )
         self.context_manager = ContextManager(settings, memory, self._sqlite_call)
         self.working_memory = WorkingMemoryService(memory, self._sqlite_call)
 
@@ -399,6 +422,8 @@ class LLMHandler:
             ),
             "sfm_knowledge_service": self.sfm_knowledge_service,
             "sfm_generation_workflow": self._sfm_generation_workflow(llm),
+            "web_research_service": self.web_research_service,
+            "web_research_budget": self.web_research_service.new_request_budget(),
         }
 
     async def command_tool_context(
@@ -406,6 +431,9 @@ class LLMHandler:
         event: GroupMessageEvent,
         *,
         deadline_monotonic: float,
+        task_identity: TaskIdentity | None = None,
+        event_sink: EventSink | None = None,
+        tool_call_id: str | None = None,
     ) -> ToolContext:
         """Build the same service, permission, and budget context used by Agent tools."""
         llm = await self._llm_for_group(event.group_id)
@@ -422,6 +450,10 @@ class LLMHandler:
             evidence_limit=8,
             tool_timeout_seconds=self.settings.network_tool_timeout,
             result_max_chars=self.settings.agent_tool_results_max_chars,
+            task_identity=task_identity,
+            event_sink=event_sink,
+            tool_call_id=tool_call_id,
+            agent_round=1 if tool_call_id else None,
             extensions=self._tool_extensions(llm),
         )
 
@@ -435,8 +467,9 @@ class LLMHandler:
     async def _reply_with_llm(
         self,
         event: GroupMessageEvent,
-        on_tool_call=None,
         context_snapshot: ContextSnapshot | None = None,
+        task_identity: TaskIdentity | None = None,
+        event_sink: EventSink | None = None,
     ) -> str:
         deadline = asyncio.get_running_loop().time() + self.settings.agent_total_timeout
         llm = await self._llm_for_group(event.group_id)
@@ -454,6 +487,17 @@ class LLMHandler:
                 reply_message_id=event.reply_message_id or None,
                 event_timestamp=event.timestamp,
             )
+        if task_identity is None:
+            scheduled = isinstance(event.raw_event, dict) and "scheduled_task_id" in event.raw_event
+            task_identity = TaskIdentity.create(
+                request_id=context_snapshot.request_id or str(event.message_id or ""),
+                group_id=str(event.group_id),
+                user_id=str(event.user_id),
+                epoch=context_snapshot.epoch,
+                origin="scheduled_task" if scheduled else "user_message",
+            )
+        if event_sink is None:
+            event_sink = RequestAgentEventSink(task_identity)
         query = self._request_text(event)
         if not query and event.attachments:
             query = "用户发送了附件。"
@@ -496,6 +540,7 @@ class LLMHandler:
             context_budget=getattr(llm, "context_budget", None),
             profile_key=getattr(llm, "context_profile_key", None),
             deadline=deadline,
+            task_identity=task_identity,
         )
         messages = [dict(message) for message in prepared.messages]
         if not await context_guard():
@@ -521,7 +566,6 @@ class LLMHandler:
                 temperature=self.settings.default_temperature,
                 presence_penalty=self.settings.default_presence_penalty,
                 frequency_penalty=self.settings.default_frequency_penalty,
-                on_tool_call=on_tool_call,
                 local_knowledge_search=self._search_local_knowledge,
                 tool_extensions=self._tool_extensions(llm),
                 deadline=deadline,
@@ -532,6 +576,8 @@ class LLMHandler:
                 working_state=prepared.working_state if prepared.persisted else None,
                 working_memory=self.working_memory if prepared.persisted else None,
                 on_context_compaction=record_context_compaction if prepared.persisted else None,
+                task_identity=task_identity,
+                event_sink=event_sink,
             )
             fallback = self._fallback_llm(llm)
             if fallback is not None and self._agent_failed(reply):
@@ -548,7 +594,6 @@ class LLMHandler:
                     temperature=self.settings.default_temperature,
                     presence_penalty=self.settings.default_presence_penalty,
                     frequency_penalty=self.settings.default_frequency_penalty,
-                    on_tool_call=on_tool_call,
                     local_knowledge_search=self._search_local_knowledge,
                     tool_extensions=self._tool_extensions(fallback),
                     deadline=deadline,
@@ -559,27 +604,47 @@ class LLMHandler:
                     working_state=prepared.working_state if prepared.persisted else None,
                     working_memory=self.working_memory if prepared.persisted else None,
                     on_context_compaction=record_context_compaction if prepared.persisted else None,
+                    task_identity=task_identity,
+                    event_sink=event_sink,
                 )
             if self._agent_failed(reply):
                 raise RuntimeError(reply)
             return _sanitize_qq_text(reply)
 
+        def emit_model(kind: AgentEventKind, *, attempt: int, outcome: ToolOutcome | None = None) -> None:
+            try:
+                event_sink.emit(kind, AgentEventPayload(outcome=outcome, attempt=attempt))
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("model lifecycle event was dropped", exc_info=True)
+
         try:
             if not await context_guard():
                 raise ContextEpochChanged("context epoch changed before model dispatch")
-            reply = await _await_before_deadline(
-                _safe_chat_call(llm, messages, **chat_kwargs),
-                deadline,
-            )
+            emit_model(AgentEventKind.MODEL_REQUEST_STARTED, attempt=1)
+            try:
+                reply = await _await_before_deadline(
+                    _safe_chat_call(llm, messages, **chat_kwargs),
+                    deadline,
+                )
+            except Exception:
+                emit_model(AgentEventKind.MODEL_REQUEST_COMPLETED, attempt=1, outcome=ToolOutcome.ERROR)
+                raise
+            emit_model(AgentEventKind.MODEL_REQUEST_COMPLETED, attempt=1, outcome=ToolOutcome.SUCCESS)
         except Exception as exc:  # noqa: BLE001
             fallback = self._fallback_llm(llm)
             if fallback is None:
                 raise
             LOGGER.warning("selected model failed, falling back to DeepSeek: %s", exc)
-            reply = await _await_before_deadline(
-                _safe_chat_call(fallback, messages, **chat_kwargs),
-                deadline,
-            )
+            emit_model(AgentEventKind.MODEL_REQUEST_STARTED, attempt=2)
+            try:
+                reply = await _await_before_deadline(
+                    _safe_chat_call(fallback, messages, **chat_kwargs),
+                    deadline,
+                )
+            except Exception:
+                emit_model(AgentEventKind.MODEL_REQUEST_COMPLETED, attempt=2, outcome=ToolOutcome.ERROR)
+                raise
+            emit_model(AgentEventKind.MODEL_REQUEST_COMPLETED, attempt=2, outcome=ToolOutcome.SUCCESS)
         return _sanitize_qq_text(reply)
 
     async def _search_local_knowledge(self, query: str) -> ToolResult:

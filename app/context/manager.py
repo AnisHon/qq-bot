@@ -15,6 +15,7 @@ from app.context.contracts import (
     PreparedContext,
     WorkingState,
 )
+from app.progress.events import TaskIdentity
 from app.context.history import (
     HistoryRetriever,
     HistoryVectorIndex,
@@ -70,6 +71,7 @@ class ContextManager:
         context_budget: ContextWindowBudget | None,
         profile_key: str | None,
         deadline: float | None = None,
+        task_identity: TaskIdentity | None = None,
     ) -> PreparedContext:
         if snapshot.group_id != str(event.group_id) or snapshot.user_id != str(event.user_id):
             raise ContextAssemblyError("snapshot_scope_mismatch", "Request snapshot does not match the current QQ event")
@@ -500,7 +502,7 @@ class ContextManager:
             )
 
         working_state = WorkingState(
-            task_id=snapshot.request_id,
+            task_id=task_identity.task_id if task_identity is not None else snapshot.request_id,
             group_id=snapshot.group_id,
             user_id=snapshot.user_id,
             request_id=snapshot.request_id,
