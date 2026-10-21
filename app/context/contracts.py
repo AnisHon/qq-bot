@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from app.context.budget import ContextBudgetDecision
+from app.planning.contracts import TaskPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,12 +87,15 @@ class WorkingState:
     open_questions: tuple[str, ...] = ()
     status: Literal["running", "completed", "failed", "cancelled", "interrupted"] = "running"
     checkpoint_revision: int = 0
+    task_plan: TaskPlan | None = None
 
     def __post_init__(self) -> None:
         if not self.task_id or not self.group_id or not self.user_id or not self.request_id:
             raise ValueError("working state requires task, group, user, and request identifiers")
         if self.epoch < 0 or self.checkpoint_revision < 0:
             raise ValueError("working state revisions cannot be negative")
+        if self.task_plan is not None and self.task_plan.task_id != self.task_id:
+            raise ValueError("task plan identity must match its working state")
 
 
 @dataclass(frozen=True, slots=True)

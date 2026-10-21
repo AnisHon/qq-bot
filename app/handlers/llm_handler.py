@@ -582,11 +582,12 @@ class LLMHandler:
                 context_guard=context_guard,
                 context_plan=prepared.context_plan,
                 context_epoch=context_snapshot.epoch,
-                working_state=prepared.working_state if prepared.persisted else None,
+                working_state=prepared.working_state,
                 working_memory=self.working_memory if prepared.persisted else None,
                 on_context_compaction=record_context_compaction if prepared.persisted else None,
                 task_identity=task_identity,
                 event_sink=event_sink,
+                planning_enabled=True,
             )
             fallback = self._fallback_llm(llm)
             if fallback is not None and self._agent_failed(reply):
@@ -610,11 +611,12 @@ class LLMHandler:
                     context_guard=context_guard,
                     context_plan=prepared.context_plan,
                     context_epoch=context_snapshot.epoch,
-                    working_state=prepared.working_state if prepared.persisted else None,
+                    working_state=prepared.working_state,
                     working_memory=self.working_memory if prepared.persisted else None,
                     on_context_compaction=record_context_compaction if prepared.persisted else None,
                     task_identity=task_identity,
                     event_sink=event_sink,
+                    planning_enabled=False,
                 )
             if self._agent_failed(reply):
                 raise RuntimeError(reply)

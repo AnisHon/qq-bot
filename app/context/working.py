@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from app.context.contracts import WorkingState
 from app.memory import MemoryStore
+from app.planning.contracts import TaskPlan
 
 
 class WorkingStateConflict(RuntimeError):
@@ -89,6 +90,14 @@ class WorkingMemoryService:
             payload["evidence_refs"] = tuple(payload.get("evidence_refs", ()))
             payload["assumptions"] = tuple(payload.get("assumptions", ()))
             payload["open_questions"] = tuple(payload.get("open_questions", ()))
+            stored_plan = payload.get("task_plan")
+            parsed_plan = TaskPlan.from_dict(stored_plan)
+            # Older checkpoints have no task_plan field. A present but invalid
+            # plan must not be silently discarded, since that would turn an
+            # incomplete planned task into an apparently unplanned one.
+            if stored_plan is not None and parsed_plan is None:
+                return None
+            payload["task_plan"] = parsed_plan
             return self._bounded(WorkingState(**payload))
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
@@ -108,6 +117,8 @@ class WorkingMemoryService:
         if max(len(state.constraints), len(state.completed_steps), len(state.pending_steps),
                len(state.evidence_refs), len(state.assumptions), len(state.open_questions)) > 64:
             raise ValueError("working state item count exceeds the limit")
+        if state.task_plan is not None and state.task_plan.task_id != state.task_id:
+            raise ValueError("working state task plan scope is invalid")
         if len(WorkingMemoryService._encode(state).encode("utf-8")) > 32_768:
             raise ValueError("working state is too large")
         return state

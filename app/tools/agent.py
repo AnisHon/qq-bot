@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import logging
 import re
@@ -31,13 +31,17 @@ from app.context.contracts import ContextMessagePlan
 from app.context.budget import ContextWindowError
 from app.context.compaction import AgentContextCompactor, EvidenceStore, ProtocolBlock
 from app.progress.events import (
-    AgentEventKind, AgentEventPayload, EventSink, TaskIdentity, ToolCategory, ToolOutcome,
+    AgentEventKind, AgentEventPayload, CommentaryKind, EventSink, PublicCommentary,
+    TaskIdentity, ToolCategory, ToolOutcome,
 )
 from app.progress.commentary import (
     PUBLIC_COMMENTARY_TOOL,
     commentary_delivery_available,
     public_commentary_spec,
 )
+from app.planning.contracts import TaskComplexity, TaskPlan, StepStatus
+from app.planning.controller import PlanExecutionController, plan_tool_specs
+from app.planning.planner import assess_task_complexity, generate_task_plan
 
 
 LOGGER = logging.getLogger(__name__)
@@ -468,6 +472,8 @@ def _build_legacy_registry() -> ToolRegistry:
     registry = ToolRegistry(build_legacy_tool_specs(_LEGACY_TOOL_DEFINITIONS))
     registry.register(_task_evidence_read_spec())
     registry.register(public_commentary_spec())
+    for spec in plan_tool_specs():
+        registry.register(spec)
     registry.freeze()
     return registry
 
@@ -485,12 +491,15 @@ def agent_tool_names(
     user_id: str = "",
     task_identity: TaskIdentity | None = None,
     event_sink: EventSink | None = None,
+    planning_enabled: bool = False,
 ) -> frozenset[str]:
     names = TOOL_REGISTRY.names(
         policy_snapshot, group_id=group_id, user_id=user_id, include_internal=True,
     )
     if not commentary_delivery_available(event_sink, task_identity):
         names = names - {PUBLIC_COMMENTARY_TOOL}
+    if not planning_enabled:
+        names = names - {"plan_step_assess", "replan_task"}
     return names
 
 
@@ -501,6 +510,7 @@ def agent_tool_schemas(
     user_id: str = "",
     task_identity: TaskIdentity | None = None,
     event_sink: EventSink | None = None,
+    planning_enabled: bool = False,
 ) -> list[dict[str, Any]]:
     names = agent_tool_names(
         policy_snapshot,
@@ -508,6 +518,7 @@ def agent_tool_schemas(
         user_id=user_id,
         task_identity=task_identity,
         event_sink=event_sink,
+        planning_enabled=planning_enabled,
     )
     return TOOL_REGISTRY.openai_schemas(
         policy_snapshot, group_id=group_id, user_id=user_id, enabled_names=names,
@@ -561,6 +572,7 @@ async def run_agent_loop(
     on_context_compaction=None,
     task_identity: TaskIdentity | None = None,
     event_sink: EventSink | None = None,
+    planning_enabled: bool = False,
 ) -> str:
     """Agentic tool-use loop using DeepSeek native function calling.
 
@@ -585,13 +597,30 @@ async def run_agent_loop(
     protocol_blocks: list[ProtocolBlock] = []
     compactor = AgentContextCompactor()
     evidence_store = EvidenceStore()
-    request_id = budget_scope.request_id if budget_scope is not None else f"agent-{id(messages)}"
-    request_group_id = (budget_scope.group_id or "") if budget_scope is not None else ""
-    request_user_id = (budget_scope.user_id or "") if budget_scope is not None else ""
+    request_id = (
+        ((budget_scope.request_id or "") if budget_scope is not None else "")
+        or (working_state.request_id if working_state is not None else f"agent-{id(messages)}")
+    )
+    request_group_id = (
+        ((budget_scope.group_id or "") if budget_scope is not None else "")
+        or (working_state.group_id if working_state is not None else "")
+    )
+    request_user_id = (
+        ((budget_scope.user_id or "") if budget_scope is not None else "")
+        or (working_state.user_id if working_state is not None else "")
+    )
+    # Keep the request-local EvidenceStore scope identical for insertion,
+    # metadata checks and reads. Direct Agent callers may provide a
+    # WorkingState without the optional context_epoch argument.
+    evidence_epoch = (
+        context_epoch if context_epoch is not None
+        else working_state.epoch if working_state is not None else 0
+    )
     context_budget = getattr(llm, "context_budget", None)
     profile_key = getattr(llm, "context_profile_key", None)
     counted_removed_context: set[str] = set()
     counted_archived_rounds: set[int] = set()
+    plan_completion_retry_used = False
 
     def emit(kind: AgentEventKind, payload: AgentEventPayload | None = None, *,
              round_index: int | None = None, tool_call_id: str | None = None) -> None:
@@ -652,7 +681,10 @@ async def run_agent_loop(
 
     async def save_working_state(*, status: str | None = None, **changes) -> None:
         nonlocal working_state
-        if working_state is None or working_memory is None:
+        if working_state is None:
+            return
+        if working_memory is None:
+            working_state = replace(working_state, status=status or working_state.status, **changes)
             return
         try:
             working_state = await working_memory.checkpoint(working_state, status=status, **changes)
@@ -665,14 +697,6 @@ async def run_agent_loop(
             revision=working_state.checkpoint_revision,
         ))
 
-    allowed_names = agent_tool_names(
-        policy_snapshot,
-        group_id=budget_scope.group_id or "" if budget_scope is not None else "",
-        user_id=budget_scope.user_id or "" if budget_scope is not None else "",
-        task_identity=task_identity,
-        event_sink=event_sink,
-    )
-
     if working_state is not None and working_memory is not None:
         try:
             working_state = await working_memory.start(working_state)
@@ -684,10 +708,173 @@ async def run_agent_loop(
     else:
         emit(AgentEventKind.WORKING_STATE_NOT_CONFIGURED)
 
+    plan_controller: PlanExecutionController | None = None
+    planning_scope_valid = (
+        working_state is not None
+        and (task_identity is None or (
+            task_identity.task_id == working_state.task_id
+            and task_identity.request_id == working_state.request_id
+            and task_identity.group_id == working_state.group_id
+            and task_identity.user_id == working_state.user_id
+            and task_identity.epoch == working_state.epoch
+        ))
+    )
+    if planning_enabled and working_state is not None and not planning_scope_valid:
+        LOGGER.warning("task planning skipped because WorkingState and TaskIdentity scopes differ")
+    complexity = (
+        assess_task_complexity(working_state.goal)
+        if planning_enabled and planning_scope_valid and working_state is not None
+        else TaskComplexity.SIMPLE
+    )
+    if (
+        planning_enabled
+        and working_state is not None
+        and complexity != TaskComplexity.SIMPLE
+        and callable(getattr(llm, "chat", None))
+        and deadline - loop.time() >= 4.0
+    ):
+        enabled_plan_tools = TOOL_REGISTRY.names(
+            policy_snapshot,
+            group_id=working_state.group_id,
+            user_id=working_state.user_id,
+        )
+        if context_guard is not None and not await context_guard():
+            raise ContextEpochChanged("context epoch changed before planning model dispatch")
+        emit(AgentEventKind.MODEL_REQUEST_STARTED, AgentEventPayload(attempt=1), round_index=1)
+        try:
+            initial_plan = await generate_task_plan(
+                llm,
+                task_id=working_state.task_id,
+                goal=working_state.goal,
+                constraints=working_state.constraints,
+                enabled_tools=enabled_plan_tools,
+                deadline=deadline,
+                loop=loop,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - planning failure falls back to the original loop
+            emit(AgentEventKind.MODEL_REQUEST_COMPLETED, AgentEventPayload(
+                outcome=ToolOutcome.ERROR, attempt=1,
+            ), round_index=1)
+            LOGGER.info("task planning was unavailable (%s); using the normal Agent path", type(exc).__name__)
+        else:
+            emit(AgentEventKind.MODEL_REQUEST_COMPLETED, AgentEventPayload(
+                outcome=ToolOutcome.SUCCESS, attempt=1,
+            ), round_index=1)
+            if context_guard is not None and not await context_guard():
+                raise ContextEpochChanged("context epoch changed before plan checkpoint")
+
+            async def persist_plan(plan: TaskPlan) -> None:
+                completed = tuple(
+                    f"{step.step_id}: {step.description}" for step in plan.steps
+                    if step.status == StepStatus.COMPLETED
+                )
+                pending = tuple(
+                    f"{step.step_id}: {step.description} [{step.status.value}]"
+                    for step in plan.steps if step.status != StepStatus.COMPLETED
+                )
+                await save_working_state(task_plan=plan, completed_steps=completed, pending_steps=pending)
+
+            def emit_plan_event(
+                event_name: str, plan: TaskPlan, step_id: str | None, round_index: int,
+            ) -> None:
+                if event_sink is None or task_identity is None:
+                    return
+                kind = {
+                    "step_updated": AgentEventKind.PLAN_STEP_UPDATED,
+                    "plan_revised": AgentEventKind.PLAN_REVISED,
+                }.get(event_name, AgentEventKind.PLAN_CREATED)
+                step = next((row for row in plan.steps if row.step_id == step_id), None)
+                try:
+                    event_sink.emit(kind, AgentEventPayload(
+                        revision=plan.revision,
+                        completed_count=sum(row.status == StepStatus.COMPLETED for row in plan.steps),
+                        total_count=len(plan.steps),
+                        plan_step_id=step_id,
+                        plan_step_status=step.status.value if step is not None else None,
+                    ), round_index=max(1, round_index))
+                    if (
+                        step is not None and step.status == StepStatus.COMPLETED
+                        and step.tool_call_ids
+                    ):
+                        public = PublicCommentary(
+                            kind=CommentaryKind.UPDATE,
+                            text=(f"计划状态：{sum(row.status == StepStatus.COMPLETED for row in plan.steps)} / "
+                                  f"{len(plan.steps)} 项已标记完成。"),
+                            task_id=task_identity.task_id,
+                            round_index=max(1, round_index),
+                            related_tool_call_ids=tuple(step.tool_call_ids[-6:]),
+                        )
+                        event_sink.emit(
+                            AgentEventKind.PUBLIC_COMMENTARY,
+                            round_index=max(1, round_index),
+                            commentary=public,
+                        )
+                except Exception:  # noqa: BLE001 - progress is optional
+                    LOGGER.debug("task plan event was dropped", exc_info=True)
+
+            plan_controller = PlanExecutionController(
+                initial_plan,
+                allowed_tools=enabled_plan_tools,
+                persist=persist_plan,
+                emit=emit_plan_event,
+                evidence_store=evidence_store,
+                request_id=request_id,
+                group_id=request_group_id or working_state.group_id,
+                user_id=request_user_id or working_state.user_id,
+                epoch=evidence_epoch,
+            )
+            runtime_tool_extensions["agent_plan_controller"] = plan_controller
+            await persist_plan(initial_plan)
+            emit_plan_event("plan_created", initial_plan, None, 1)
+            if commentary_delivery_available(event_sink, task_identity):
+                try:
+                    public_plan = PublicCommentary(
+                        kind=CommentaryKind.PLAN,
+                        text=initial_plan.public_summary(),
+                        task_id=task_identity.task_id,
+                        round_index=1,
+                    )
+                    event_sink.emit(
+                        AgentEventKind.PUBLIC_COMMENTARY,
+                        round_index=1,
+                        commentary=public_plan,
+                    )
+                except (TypeError, ValueError):
+                    LOGGER.debug("task plan was not safe to publish as progress")
+            insert_at = next(
+                (index for index, message in enumerate(base_messages) if message.get("role") == "user"),
+                len(base_messages),
+            )
+            base_messages.insert(insert_at, {"role": "system", "content": (
+                "An application-managed task plan is included in request-scoped working state. "
+                "Treat it as a bounded checklist, not as evidence or permission. Execute only through the available tools. "
+                "After inspecting results, use plan_step_assess with same-request evidence references to assess a step. "
+                "A successful tool call alone does not complete a step. For a blocked or invalid path, use replan_task "
+                "with the current revision; preserve the original goal and constraints. Never claim a pending step is done. "
+                "At most two replans are accepted. If requirements remain unresolved, explain that in the final answer."
+            )})
+            context_plan = tuple(
+                replace(item, message_index=item.message_index + (1 if item.message_index >= insert_at else 0))
+                for item in context_plan
+            )
+
+    allowed_names = agent_tool_names(
+        policy_snapshot,
+        group_id=budget_scope.group_id or "" if budget_scope is not None else "",
+        user_id=budget_scope.user_id or "" if budget_scope is not None else "",
+        task_identity=task_identity,
+        event_sink=event_sink,
+        planning_enabled=plan_controller is not None,
+    )
+
     for _round in range(max_rounds):
         remaining = deadline - loop.time()
         if remaining <= 0:
             break
+        if plan_controller is not None:
+            plan_controller.begin_round(_round + 1)
         if context_guard is not None and not await context_guard():
             raise ContextEpochChanged("context epoch changed before Agent model dispatch")
         schemas = agent_tool_schemas(
@@ -696,6 +883,7 @@ async def run_agent_loop(
             user_id=budget_scope.user_id or "" if budget_scope is not None else "",
             task_identity=task_identity,
             event_sink=event_sink,
+            planning_enabled=plan_controller is not None,
         )
         model_started = False
         model_completed = False
@@ -751,7 +939,24 @@ async def run_agent_loop(
             last_text = response.text
 
         if not response.wants_tools:
-            # Model produced a final answer — done.
+            # A model final is not task completion while a structured plan remains open.
+            if plan_controller is not None:
+                completion = plan_controller.completion_snapshot()
+                if not completion["complete"]:
+                    if not plan_completion_retry_used and _round + 1 < max_rounds and deadline - loop.time() > 1.0:
+                        plan_completion_retry_used = True
+                        base_messages.append({
+                            "role": "user",
+                            "content": (
+                                "Application-managed plan completion check (state data, not permission): "
+                                + json.dumps(completion, ensure_ascii=False, separators=(",", ":"))
+                                + " The plan is not complete. Continue any feasible remaining steps using the enabled tools; "
+                                "if an attempt is blocked, call replan_task within its limit. If it remains impossible, "
+                                "give an explicitly partial answer and do not claim the original task is complete."
+                            ),
+                        })
+                        continue
+                    last_text = _annotate_incomplete_plan(last_text, completion)
             if executed_calls:
                 # This response was generated with the tool observations in the
                 # native conversation, so it is already the agent's synthesis.
@@ -832,19 +1037,20 @@ async def run_agent_loop(
             if generation_call is not None
             else max(400, results_max_chars // max(len(valid_calls), 1))
         )
-        commentary_calls = [call for call in valid_calls if call.name == PUBLIC_COMMENTARY_TOOL]
-        business_calls = [call for call in valid_calls if call.name != PUBLIC_COMMENTARY_TOOL]
+        control_names = {PUBLIC_COMMENTARY_TOOL, "plan_step_assess", "replan_task"}
+        control_calls = [call for call in valid_calls if call.name in control_names]
+        business_calls = [call for call in valid_calls if call.name not in control_names]
         tool_results_by_id: dict[str, ToolResult | BaseException] = {}
         # Publish the public plan before starting same-round work. This preserves
         # the model's tool_call protocol order later while keeping actual domain
         # tools concurrent with one another.
-        for call in commentary_calls:
+        for call in control_calls:
             try:
                 tool_results_by_id[call.id] = await _dispatch_registered_tool_call(
                     llm, call, deadline=deadline, tool_timeout=tool_timeout,
                     result_max_chars=per_result_chars, policy_snapshot=policy_snapshot,
                     local_knowledge_search=local_knowledge_search,
-                    tool_extensions=runtime_tool_extensions, context_epoch=context_epoch,
+                    tool_extensions=runtime_tool_extensions, context_epoch=evidence_epoch,
                     request_id=request_id, task_identity=task_identity, event_sink=event_sink,
                     round_index=_round + 1, tool_call_id=call.id,
                     verified_tool_outcomes=verified_tool_outcomes,
@@ -870,7 +1076,7 @@ async def run_agent_loop(
                     policy_snapshot=policy_snapshot,
                     local_knowledge_search=local_knowledge_search,
                     tool_extensions=runtime_tool_extensions,
-                    context_epoch=context_epoch,
+                    context_epoch=evidence_epoch,
                     request_id=request_id,
                     task_identity=task_identity,
                     event_sink=event_sink,
@@ -924,6 +1130,7 @@ async def run_agent_loop(
             for call in valid_calls
         ]
         for tc, result in zip(valid_calls, results):
+            result_refs: tuple[str, ...] = ()
             if isinstance(result, BaseException):
                 content = f"工具 {tc.name} 执行失败。"
                 result_statuses[tc.id] = "error"
@@ -939,7 +1146,7 @@ async def run_agent_loop(
                     request_id=request_id,
                     group_id=request_group_id,
                     user_id=request_user_id,
-                    epoch=context_epoch if context_epoch is not None else 0,
+                    epoch=evidence_epoch,
                     tool_call_id=tc.id,
                 )
                 evidence_by_call[tc.id] = result_refs
@@ -947,7 +1154,7 @@ async def run_agent_loop(
                 for ref in result_refs:
                     metadata = evidence_store.metadata_for(
                         ref, request_id=request_id, group_id=request_group_id,
-                        user_id=request_user_id, epoch=context_epoch if context_epoch is not None else 0,
+                        user_id=request_user_id, epoch=evidence_epoch,
                     )
                     if metadata is not None:
                         evidence_metadata.append(metadata)
@@ -975,6 +1182,16 @@ async def run_agent_loop(
                         reference = (priority, item.title, item.locator)
                         if reference not in references:
                             references.append(reference)
+            spec = TOOL_REGISTRY.get(tc.name)
+            if (
+                plan_controller is not None
+                and spec is not None
+                and spec.progress_category != ToolCategory.COMMENTARY
+            ):
+                await plan_controller.observe_tool_result(
+                    tc.id, tc.name, result, result_refs,
+                    round_index=_round + 1,
+                )
             observations[tc.id] = content
 
         # DeepSeek requires exactly one tool response for every tool_call id.
@@ -1002,7 +1219,7 @@ async def run_agent_loop(
         compactor.validate_protocol_block(block)
         protocol_blocks.append(block)
 
-        if working_state is not None and working_memory is not None:
+        if working_state is not None:
             step_updates = tuple(
                 f"{tc.name}: {result_statuses.get(tc.id, 'unknown')}"
                 for tc in response.tool_calls
@@ -1016,8 +1233,21 @@ async def run_agent_loop(
                 and (TOOL_REGISTRY.get(tc.name) is None or
                      TOOL_REGISTRY.get(tc.name).progress_category != ToolCategory.COMMENTARY)
             )
+            if plan_controller is None:
+                completed = tuple((*working_state.completed_steps, *step_updates)[-32:])
+                pending = working_state.pending_steps
+            else:
+                completed = tuple(
+                    f"{step.step_id}: {step.description}" for step in plan_controller.plan.steps
+                    if step.status == StepStatus.COMPLETED
+                )
+                pending = tuple(
+                    f"{step.step_id}: {step.description} [{step.status.value}]"
+                    for step in plan_controller.plan.steps if step.status != StepStatus.COMPLETED
+                )
             await save_working_state(
-                completed_steps=tuple((*working_state.completed_steps, *step_updates)[-32:]),
+                completed_steps=completed,
+                pending_steps=pending,
                 open_questions=tuple((*working_state.open_questions, *failures)[-32:]),
                 evidence_refs=tuple(dict.fromkeys((*working_state.evidence_refs, *evidence_refs)))[-64:],
             )
@@ -1042,7 +1272,15 @@ async def run_agent_loop(
         )
         await record_compaction(final_fit)
         messages[:] = [dict(message) for message in final_fit.messages]
-        final_messages = _build_final_answer_messages(messages, results_max_chars * 2)
+        completion = plan_controller.completion_snapshot() if plan_controller is not None else None
+        completion_note = (
+            "Application completion check: the structured task plan is not complete. "
+            "Clearly state that the answer is partial and do not claim unresolved requirements were satisfied."
+            if completion is not None and not completion["complete"] else None
+        )
+        final_messages = _build_final_answer_messages(
+            messages, results_max_chars * 2, completion_note=completion_note,
+        )
         remaining = deadline - loop.time()
         if remaining <= 0:
             raise TimeoutError("Agent deadline expired before final response")
@@ -1067,6 +1305,8 @@ async def run_agent_loop(
         ), round_index=max_rounds + 1)
         model_completed = True
         candidate = str(final).strip()
+        if completion is not None and not completion["complete"]:
+            candidate = _annotate_incomplete_plan(candidate, completion)
         await save_working_state(status="completed")
         if executed_calls:
             return _append_references(_validate_research_answer(candidate, messages), references)
@@ -1166,6 +1406,7 @@ def _working_state_prompt_data(state: WorkingState) -> dict[str, Any]:
         "open_questions": list(state.open_questions),
         "status": state.status,
         "checkpoint_revision": state.checkpoint_revision,
+        "task_plan": state.task_plan.as_prompt_data() if state.task_plan is not None else None,
     }
 
 
@@ -1284,7 +1525,12 @@ def _parse_dsml_tool_calls(text: str) -> list[ToolCallRequest]:
     return calls
 
 
-def _build_final_answer_messages(messages: list[dict[str, Any]], max_evidence_chars: int) -> list[dict[str, str]]:
+def _build_final_answer_messages(
+    messages: list[dict[str, Any]],
+    max_evidence_chars: int,
+    *,
+    completion_note: str | None = None,
+) -> list[dict[str, str]]:
     """Flatten research into a clean prompt so the final call cannot continue the tool protocol."""
     system_parts = [
         str(message.get("content") or "")
@@ -1313,7 +1559,8 @@ def _build_final_answer_messages(messages: list[dict[str, Any]], max_evidence_ch
                 "Do not call, request, simulate, or mention tools. "
                 "Use evidence when available; otherwise give a useful best-effort answer and mark uncertainty. "
                 "For recipes, verify the exact target output/item id and ingredient relationship. Never convert a similarly named item, input, quest mention, reward, dependency, or unrelated pattern into the requested recipe. "
-                "Copy identifiers exactly. In FTB data, tasks are requirements and rewards are received only after completion."
+                "Copy identifiers exactly. In FTB data, tasks are requirements and rewards are received only after completion. "
+                + (completion_note or "")
             ),
         },
         {
@@ -1325,6 +1572,20 @@ def _build_final_answer_messages(messages: list[dict[str, Any]], max_evidence_ch
             ),
         },
     ]
+
+
+def _annotate_incomplete_plan(answer: str, completion: Mapping[str, Any]) -> str:
+    total = int(completion.get("total_count", 0))
+    complete = int(completion.get("completed_count", 0))
+    remaining = max(0, total - complete)
+    note = (
+        f"任务未完全完成：计划中 {complete}/{total} 项步骤有完成记录，"
+        f"另有 {remaining} 项未完成或未验证。以下仅为当前部分结果。"
+    )
+    cleaned = str(answer or "").strip()
+    if cleaned.startswith("任务未完全完成："):
+        return cleaned
+    return f"{note}\n\n{cleaned}" if cleaned else note
 
 
 async def _generate_final_answer(

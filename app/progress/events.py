@@ -30,6 +30,9 @@ class AgentEventKind(StrEnum):
     COMPACTION_COMPLETED = "compaction_completed"
     CHECKPOINT_SAVED = "checkpoint_saved"
     PUBLIC_COMMENTARY = "public_commentary"
+    PLAN_CREATED = "plan_created"
+    PLAN_STEP_UPDATED = "plan_step_updated"
+    PLAN_REVISED = "plan_revised"
     WORKING_STATE_NOT_CONFIGURED = "working_state_not_configured"
     WORKING_STATE_SAVE_FAILED = "working_state_save_failed"
     TASK_COMPLETED = "task_completed"
@@ -157,6 +160,8 @@ class AgentEventPayload:
     revision: int | None = None
     attempt: int | None = None
     elapsed_bucket: str | None = None
+    plan_step_id: str | None = None
+    plan_step_status: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("evidence_count", "completed_count", "total_count", "revision", "attempt"):
@@ -165,6 +170,12 @@ class AgentEventPayload:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.completeness not in {None, "complete", "partial", "reference_only", "unavailable"}:
             raise ValueError("invalid evidence completeness")
+        if self.plan_step_id is not None and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", self.plan_step_id):
+            raise ValueError("invalid plan step id")
+        if self.plan_step_status not in {
+            None, "pending", "ready", "in_progress", "completed", "blocked", "failed", "skipped",
+        }:
+            raise ValueError("invalid plan step status")
         if self.elapsed_bucket not in {None, "<3s", "3-8s", "8-30s", "30-60s", "60s+"}:
             raise ValueError("invalid elapsed time bucket")
 
