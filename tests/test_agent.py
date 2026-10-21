@@ -12,7 +12,15 @@ from app.models import SearchResult
 from app.tools.agent import TOOL_REGISTRY
 from app.tools.contracts import search_results_to_tool_result
 from app.progress.events import AgentEventKind, RequestAgentEventSink, TaskIdentity
-from app.tools.agent import _parse_dsml_tool_calls, _tool_call_message, _tool_signature, _validate_research_answer, run_agent_loop
+from app.tools.agent import (
+    AnswerValidationStatus,
+    _parse_dsml_tool_calls,
+    _tool_call_message,
+    _tool_signature,
+    _validate_research_answer,
+    _validated_research_answer,
+    run_agent_loop,
+)
 
 
 class _FakeLLM:
@@ -83,16 +91,59 @@ class AgentLoopTest(IsolatedAsyncioTestCase):
                 "content": "关系检测：目标作为任务要求出现 1 次；这不是配方输出。 allthetweaks:atm_star",
             }
         ]
-        answer = "完成FTB任务后会奖励 allthetweaks:atm_star。"
-        corrected = _validate_research_answer(answer, messages)
+        answer = "FTB 这里有任务要求关系。完成FTB任务后会奖励 allthetweaks:atm_star。"
+        validation = _validate_research_answer(answer, messages)
+        corrected = _validated_research_answer(answer, messages)
+        self.assertEqual(validation.status, AnswerValidationStatus.UNSUPPORTED_CLAIM)
+        self.assertIn("FTB 这里有任务要求关系。", corrected)
         self.assertNotIn("会奖励", corrected)
-        self.assertIn("JEI/EMI", corrected)
+        self.assertNotIn("JEI/EMI", corrected)
+        self.assertNotIn("ATM10", corrected)
 
     def test_denial_of_evidence_confirmed_item_is_rejected(self) -> None:
         messages = [{"role": "tool", "content": "任务目标 item: allthetweaks:atm_star"}]
-        corrected = _validate_research_answer("ATM10里没有叫ATM之星的物品。", messages)
+        corrected = _validated_research_answer("ATM10里没有叫ATM之星的物品。", messages)
         self.assertNotIn("没有叫", corrected)
-        self.assertIn("allthetweaks:atm_star", corrected)
+        self.assertIn("来源中出现了该物品", corrected)
+        self.assertNotIn("JEI/EMI", corrected)
+
+    def test_unverified_identifier_removes_only_the_unsupported_sentence(self) -> None:
+        messages = [{"role": "tool", "content": "验证了 gtnh:known_item 的输入关系。"}]
+        answer = "GTNH 这条产线可以继续核对。配方输出是 gtnh:invented_item。"
+        corrected = _validated_research_answer(answer, messages)
+        self.assertIn("GTNH 这条产线可以继续核对。", corrected)
+        self.assertNotIn("gtnh:invented_item", corrected)
+        self.assertIn("没有在本轮来源中核实", corrected)
+
+    def test_evidence_confirmed_identifier_is_preserved(self) -> None:
+        messages = [{"role": "tool", "content": "目标输出 item_id=gtnh:iridium_ingot"}]
+        answer = "目标物品是 gtnh:iridium_ingot。"
+        self.assertEqual(_validate_research_answer(answer, messages).status, AnswerValidationStatus.PASS)
+        self.assertEqual(_validated_research_answer(answer, messages), answer)
+
+    def test_identifier_from_retained_evidence_survives_compacted_tool_history(self) -> None:
+        answer = "目标物品是 gtnh:iridium_ingot。"
+        retained = "目标输出 item_id=gtnh:iridium_ingot"
+        self.assertEqual(
+            _validate_research_answer(answer, [], additional_evidence=retained).status,
+            AnswerValidationStatus.PASS,
+        )
+
+    def test_public_urls_are_not_misclassified_as_item_identifiers(self) -> None:
+        answer = "来源页面是 https://example.invalid/a。"
+        self.assertEqual(_validate_research_answer(answer, []).status, AnswerValidationStatus.PASS)
+
+    def test_no_results_general_explanation_is_not_rewritten(self) -> None:
+        answer = "这次没有找到相关新闻。可以换关键词或指定新闻来源再查。"
+        messages = [{"role": "tool", "content": '{"status":"no_results","results":[]}'}]
+        self.assertEqual(_validated_research_answer(answer, messages), answer)
+
+    def test_incomplete_answer_is_qualified_without_unrelated_domain_advice(self) -> None:
+        answer = "当前结果还不完整。我会再查看对应版本的配方。"
+        corrected = _validated_research_answer(answer, [])
+        self.assertIn("当前结果还不完整。", corrected)
+        self.assertIn("这轮没有完成", corrected)
+        self.assertNotIn("ATM", corrected)
 
     def test_dsml_content_is_recovered_as_tool_call(self) -> None:
         text = '''<｜｜DSML｜｜tool_calls>

@@ -7,16 +7,28 @@ from app.progress.events import ToolCategory, ToolOutcome
 MAX_STATUS_CHARS = 240
 
 _CATEGORY_TEXT = {
-    ToolCategory.WEB_SEARCH: "网页搜索",
-    ToolCategory.WEB_READ: "网页读取",
-    ToolCategory.NEWS_SEARCH: "新闻检索",
-    ToolCategory.WIKI: "本地知识检索",
-    ToolCategory.RECIPE: "配方查询",
-    ToolCategory.MACHINE: "机器配方查询",
-    ToolCategory.REPOSITORY: "仓库检索",
-    ToolCategory.SFM_VALIDATION: "SFM 校验",
-    ToolCategory.WEATHER: "天气查询",
-    ToolCategory.OTHER: "相关工具",
+    ToolCategory.WEB_SEARCH: "网页资料",
+    ToolCategory.WEB_READ: "网页正文",
+    ToolCategory.NEWS_SEARCH: "相关新闻",
+    ToolCategory.WIKI: "本地知识",
+    ToolCategory.RECIPE: "配方",
+    ToolCategory.MACHINE: "机器配方",
+    ToolCategory.REPOSITORY: "代码仓库",
+    ToolCategory.SFM_VALIDATION: "SFM 程序",
+    ToolCategory.WEATHER: "天气数据",
+    ToolCategory.OTHER: "相关内容",
+}
+_CATEGORY_ACTION = {
+    ToolCategory.WEB_SEARCH: "查找",
+    ToolCategory.WEB_READ: "读取",
+    ToolCategory.NEWS_SEARCH: "搜索",
+    ToolCategory.WIKI: "检索",
+    ToolCategory.RECIPE: "查询",
+    ToolCategory.MACHINE: "查询",
+    ToolCategory.REPOSITORY: "搜索",
+    ToolCategory.SFM_VALIDATION: "校验",
+    ToolCategory.WEATHER: "查询",
+    ToolCategory.OTHER: "处理",
 }
 _OUTCOME_TEXT = {
     ToolOutcome.SUCCESS: "成功",
@@ -39,29 +51,31 @@ def render_progress(candidate: ProgressCandidate) -> str:
         return text.replace("[CQ:", "［CQ:").replace("[cq:", "［cq:")[:MAX_STATUS_CHARS]
     active = tuple(dict.fromkeys(candidate.categories))
     if candidate.active_tools:
-        if candidate.mode == ProgressMode.VERBOSE and len(active) > 1:
-            labels = "、".join(_CATEGORY_TEXT.get(item, "相关工具") for item in active[:3])
-            text = f"正在并行进行{labels}等资料处理……"
-        elif candidate.mode == ProgressMode.VERBOSE and len(active) == 1:
-            text = f"正在进行{_CATEGORY_TEXT.get(active[0], '相关工具')}……"
+        if len(active) > 1:
+            labels = "和".join(_CATEGORY_TEXT.get(item, "相关内容") for item in active[:2])
+            suffix = "等" if len(active) > 2 else ""
+            text = f"正在{_CATEGORY_ACTION.get(active[0], '处理')}{labels}{suffix}……"
+        elif len(active) == 1:
+            category = active[0]
+            text = f"正在{_CATEGORY_ACTION.get(category, '处理')}{_CATEGORY_TEXT.get(category, '相关内容')}……"
         else:
-            text = "正在处理相关资料……"
+            text = "正在处理相关内容……"
     elif candidate.active_models:
         if candidate.outcomes:
-            text = "已完成工具处理，正在整理结果……"
+            text = "已有查询结果，我正在整理答复……"
         else:
-            text = "正在生成回复……"
+            text = "我在结合已有上下文整理答复……"
     else:
-        text = "任务仍在运行，正在处理已取得的信息……"
+        text = "我在根据已有结果继续处理……"
 
     counts = [(kind, count) for kind, count in candidate.outcomes if count > 0]
     if counts:
         total = sum(count for _, count in counts)
         if candidate.mode == ProgressMode.VERBOSE:
             parts = [f"{count} 项{_OUTCOME_TEXT.get(kind, '状态未知')}" for kind, count in counts]
-            text += f"\n已结束 {total} 项处理：" + "，".join(parts) + "。"
+            text += f"\n已有 {total} 项处理返回：" + "，".join(parts) + "。"
         else:
-            text += f"\n已结束 {total} 项工具处理。"
+            text += f"\n已有 {total} 项处理结束。"
     # Progress must never interpret CQ-looking untrusted content as a segment.
     text = text.replace("[CQ:", "［CQ:").replace("[cq:", "［cq:")
     return text[:MAX_STATUS_CHARS]

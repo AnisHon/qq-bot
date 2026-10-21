@@ -27,6 +27,7 @@ from app.context.memories import MemoryService
 from app.memory import MemoryStore
 from app.models import GroupMessageEvent
 from app.qq_context import select_recent_context_v2
+from app.prompts import CURRENT_REQUEST_GUIDANCE
 
 
 SQLiteCall = Callable[..., Any]
@@ -411,9 +412,7 @@ class ContextManager:
             "content": (
                 f"Current request from QQ {event.user_id} ({event.nickname or 'unknown'}):\n"
                 f"{query}\n\n"
-                "Answer this current request directly and concisely. Do not repeat what was already stated in previous turns unless asked to clarify. Do not start with any name or speaker label. "
-                "For research, search local knowledge first when relevant, use external tools only as needed, "
-                "and stop once the available evidence can answer the question. Do not repeat equivalent searches."
+                f"{CURRENT_REQUEST_GUIDANCE}"
             ),
         }
         selected_items = list(items)

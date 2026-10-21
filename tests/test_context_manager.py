@@ -10,6 +10,7 @@ from app.context.contracts import ContextEpochChanged, ContextSnapshot
 from app.context.manager import ContextAssemblyError, ContextManager
 from app.memory import MemoryStore
 from app.models import GroupMessageEvent, QuotedMessage
+from app.prompts import CURRENT_REQUEST_GUIDANCE
 
 
 class ContextManagerTest(unittest.IsolatedAsyncioTestCase):
@@ -106,6 +107,18 @@ class ContextManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("history:group-a:0:", dynamic_text)
         self.assertTrue(prepared.persisted)
         self.assertEqual(prepared.snapshot.current_row_id, snapshot.current_row_id)
+
+    async def test_current_request_uses_shared_task_aware_guidance(self) -> None:
+        event = self._event(text="C++ 引用在机器层面通常是什么？")
+        snapshot = await self._snapshot(event)
+        prepared = await self.manager.build(
+            event, snapshot, query=event.text, system_prompt="policy", time_prompt="time",
+            model="fixture-model", tool_schemas=[], context_budget=None, profile_key=None,
+        )
+        current = prepared.messages[-1]["content"]
+        self.assertIn("C++ 引用在机器层面通常是什么？", current)
+        self.assertTrue(current.endswith(CURRENT_REQUEST_GUIDANCE))
+        self.assertNotIn("directly and concisely", current)
 
     async def test_nonpersisted_snapshot_does_not_query_or_invent_stored_sources(self) -> None:
         calls: list[str] = []

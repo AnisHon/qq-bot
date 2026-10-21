@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from enum import StrEnum
 import json
 import logging
 import re
@@ -42,6 +43,7 @@ from app.progress.commentary import (
 from app.planning.contracts import TaskComplexity, TaskPlan, StepStatus
 from app.planning.controller import PlanExecutionController, plan_tool_specs
 from app.planning.planner import assess_task_complexity, generate_task_plan
+from app.prompts import AGENT_PLAN_EXECUTION_RULES, RESEARCH_FINAL_RULES
 
 
 LOGGER = logging.getLogger(__name__)
@@ -621,6 +623,38 @@ async def run_agent_loop(
     counted_removed_context: set[str] = set()
     counted_archived_rounds: set[int] = set()
     plan_completion_retry_used = False
+    all_evidence_refs: list[str] = []
+
+    def retained_validation_evidence() -> str:
+        """Read bounded request-local EvidenceStore content, including compacted rounds."""
+        chunks: list[str] = []
+        remaining_bytes = 512 * 1024
+        for record_id in all_evidence_refs:
+            offset = 0
+            while remaining_bytes > 0:
+                piece = evidence_store.read_segment(
+                    record_id,
+                    request_id=request_id,
+                    group_id=request_group_id,
+                    user_id=request_user_id,
+                    epoch=evidence_epoch,
+                    offset=offset,
+                    limit=min(8192, remaining_bytes),
+                )
+                if piece is None:
+                    break
+                encoded = piece.content.encode("utf-8", errors="replace")
+                if len(encoded) > remaining_bytes:
+                    piece_text = encoded[:remaining_bytes].decode("utf-8", errors="ignore")
+                    chunks.append(piece_text)
+                    remaining_bytes = 0
+                    break
+                chunks.append(piece.content)
+                remaining_bytes -= len(encoded)
+                if piece.next_offset is None:
+                    break
+                offset = piece.next_offset
+        return "\n".join(chunks)
 
     def emit(kind: AgentEventKind, payload: AgentEventPayload | None = None, *,
              round_index: int | None = None, tool_call_id: str | None = None) -> None:
@@ -798,10 +832,18 @@ async def run_agent_loop(
                         step is not None and step.status == StepStatus.COMPLETED
                         and step.tool_call_ids
                     ):
+                        next_step = next(
+                            (row for row in plan.steps if row.status == StepStatus.READY), None,
+                        )
+                        completed_text = re.sub(r"\s+", " ", step.description).strip().rstrip("。.!！?？")
+                        if next_step is not None:
+                            next_text = re.sub(r"\s+", " ", next_step.description).strip().rstrip("。.!！?？")
+                            progress_text = f"{completed_text}这部分有结果了，我接下来{next_text}。"
+                        else:
+                            progress_text = "需要的步骤已经完成，我正在整理结果。"
                         public = PublicCommentary(
                             kind=CommentaryKind.UPDATE,
-                            text=(f"计划状态：{sum(row.status == StepStatus.COMPLETED for row in plan.steps)} / "
-                                  f"{len(plan.steps)} 项已标记完成。"),
+                            text=progress_text[:240],
                             task_id=task_identity.task_id,
                             round_index=max(1, round_index),
                             related_tool_call_ids=tuple(step.tool_call_ids[-6:]),
@@ -836,25 +878,19 @@ async def run_agent_loop(
                         task_id=task_identity.task_id,
                         round_index=1,
                     )
-                    event_sink.emit(
+                    plan_accepted = event_sink.emit(
                         AgentEventKind.PUBLIC_COMMENTARY,
                         round_index=1,
                         commentary=public_plan,
                     )
+                    runtime_tool_extensions["agent_plan_publicly_announced"] = bool(plan_accepted)
                 except (TypeError, ValueError):
                     LOGGER.debug("task plan was not safe to publish as progress")
             insert_at = next(
                 (index for index, message in enumerate(base_messages) if message.get("role") == "user"),
                 len(base_messages),
             )
-            base_messages.insert(insert_at, {"role": "system", "content": (
-                "An application-managed task plan is included in request-scoped working state. "
-                "Treat it as a bounded checklist, not as evidence or permission. Execute only through the available tools. "
-                "After inspecting results, use plan_step_assess with same-request evidence references to assess a step. "
-                "A successful tool call alone does not complete a step. For a blocked or invalid path, use replan_task "
-                "with the current revision; preserve the original goal and constraints. Never claim a pending step is done. "
-                "At most two replans are accepted. If requirements remain unresolved, explain that in the final answer."
-            )})
+            base_messages.insert(insert_at, {"role": "system", "content": AGENT_PLAN_EXECUTION_RULES})
             context_plan = tuple(
                 replace(item, message_index=item.message_index + (1 if item.message_index >= insert_at else 0))
                 for item in context_plan
@@ -963,7 +999,12 @@ async def run_agent_loop(
                 # Re-prompting here adds latency and can make a second answer
                 # ignore evidence that the first answer used correctly.
                 await save_working_state(status="completed")
-                return _append_references(_validate_research_answer(last_text, messages), references)
+                return _append_references(
+                    _validated_research_answer(
+                        last_text, messages, additional_evidence=retained_validation_evidence(),
+                    ),
+                    references,
+                )
             await save_working_state(status="completed")
             return last_text
 
@@ -1151,6 +1192,7 @@ async def run_agent_loop(
                 )
                 evidence_by_call[tc.id] = result_refs
                 evidence_refs.extend(result_refs)
+                all_evidence_refs.extend(result_refs)
                 for ref in result_refs:
                     metadata = evidence_store.metadata_for(
                         ref, request_id=request_id, group_id=request_group_id,
@@ -1309,7 +1351,12 @@ async def run_agent_loop(
             candidate = _annotate_incomplete_plan(candidate, completion)
         await save_working_state(status="completed")
         if executed_calls:
-            return _append_references(_validate_research_answer(candidate, messages), references)
+            return _append_references(
+                _validated_research_answer(
+                    candidate, messages, additional_evidence=retained_validation_evidence(),
+                ),
+                references,
+            )
         return candidate
     except ContextWindowError:
         if working_state is not None and working_memory is not None and working_state.status == "running":
@@ -1555,11 +1602,7 @@ def _build_final_answer_messages(
             "role": "system",
             "content": (
                 "\n".join(system_parts[:3])
-                + "\nResearch is finished. Give the final plain-text answer now. "
-                "Do not call, request, simulate, or mention tools. "
-                "Use evidence when available; otherwise give a useful best-effort answer and mark uncertainty. "
-                "For recipes, verify the exact target output/item id and ingredient relationship. Never convert a similarly named item, input, quest mention, reward, dependency, or unrelated pattern into the requested recipe. "
-                "Copy identifiers exactly. In FTB data, tasks are requirements and rewards are received only after completion. "
+                + "\n" + RESEARCH_FINAL_RULES + " "
                 + (completion_note or "")
             ),
         },
@@ -1575,15 +1618,10 @@ def _build_final_answer_messages(
 
 
 def _annotate_incomplete_plan(answer: str, completion: Mapping[str, Any]) -> str:
-    total = int(completion.get("total_count", 0))
-    complete = int(completion.get("completed_count", 0))
-    remaining = max(0, total - complete)
-    note = (
-        f"任务未完全完成：计划中 {complete}/{total} 项步骤有完成记录，"
-        f"另有 {remaining} 项未完成或未验证。以下仅为当前部分结果。"
-    )
+    # Keep the user's scope clear without exposing internal plan counters/statuses.
+    note = "这次还有要求没能核实完，下面先给你目前有依据的部分；未确认的内容不会当成已完成。"
     cleaned = str(answer or "").strip()
-    if cleaned.startswith("任务未完全完成："):
+    if cleaned.startswith("这次还有要求没能核实完，"):
         return cleaned
     return f"{note}\n\n{cleaned}" if cleaned else note
 
@@ -1676,40 +1714,132 @@ async def _verify_research_answer(
         return candidate
 
 
-def _validate_research_answer(answer: str, messages: list[dict[str, Any]]) -> str:
-    incomplete_patterns = (
-        r"让我(?:再|重新|继续)?(?:查看|读取|搜索|查询|检查)",
-        r"我(?:再|将|会|需要)(?:查看|读取|搜索|查询|检查)",
-        r"请稍等|稍等一下|正在(?:搜索|查询|读取|检查)",
-        r"内容被截断.*(?:读取|查看)",
+class AnswerValidationStatus(StrEnum):
+    PASS = "pass"
+    INCOMPLETE = "incomplete"
+    UNSUPPORTED_CLAIM = "unsupported_claim"
+
+
+@dataclass(frozen=True, slots=True)
+class AnswerValidation:
+    status: AnswerValidationStatus
+    issues: tuple[str, ...] = ()
+    unsupported_identifiers: tuple[str, ...] = ()
+
+
+_INCOMPLETE_ANSWER_PATTERNS = (
+    r"让我(?:再|重新|继续)?(?:查看|读取|搜索|查询|检查)",
+    r"我(?:(?:将|会|需要)(?:再|重新|继续)?|再|重新|继续)(?:查看|读取|搜索|查询|检查)",
+    r"请稍等|稍等一下|正在(?:搜索|查询|读取|检查)",
+    r"内容被截断.*(?:读取|查看)",
+)
+_REVERSED_TASK_RELATION = re.compile(
+    r"(?:完成|做完|通过).{0,30}任务.{0,30}(?:奖励|获得|给你).{0,50}(?:atm.?星|allthetweaks:atm_star)",
+    re.IGNORECASE,
+)
+_DENIES_EVIDENCE_CONFIRMED_ATM_STAR = re.compile(
+    r"没有.{0,20}(?:ATM.?星|ATM之星).{0,20}物品|不存在.{0,20}(?:ATM.?星|ATM之星)",
+    re.IGNORECASE,
+)
+_NAMESPACE_IDENTIFIER = re.compile(r"\b[a-z0-9_]+:[a-z0-9_][a-z0-9_./-]*\b", re.IGNORECASE)
+
+
+def _validate_research_answer(
+    answer: str,
+    messages: list[dict[str, Any]],
+    *,
+    additional_evidence: str = "",
+) -> AnswerValidation:
+    """Detect unsupported claims without replacing the answer with unrelated advice."""
+    incomplete = any(
+        re.search(pattern, answer, re.IGNORECASE) for pattern in _INCOMPLETE_ANSWER_PATTERNS
     )
-    incomplete = any(re.search(pattern, answer, re.IGNORECASE) for pattern in incomplete_patterns)
     evidence = "\n".join(
         str(message.get("content") or "")
         for message in messages
         if message.get("role") == "tool"
-    ).lower()
-    answer_ids = set(re.findall(r"\b[a-z0-9_]+:[a-z0-9_./-]+\b", answer.lower()))
+    )
+    evidence = (evidence + "\n" + additional_evidence).lower()
+    answer_ids = {
+        value.lower() for value in _NAMESPACE_IDENTIFIER.findall(answer)
+        if value.lower().split(":", 1)[0] not in {"http", "https", "ftp"}
+    }
     invented_ids = {item_id for item_id in answer_ids if item_id not in evidence}
     reversed_task_relation = (
         "关系检测：目标作为任务要求" in evidence
-        and bool(
-            re.search(
-                r"(?:完成|做完|通过).{0,30}任务.{0,30}(?:奖励|获得|给你).{0,50}(?:atm.?星|allthetweaks:atm_star)",
-                answer,
-                re.IGNORECASE | re.DOTALL,
-            )
-        )
+        and bool(_REVERSED_TASK_RELATION.search(answer))
     )
     denies_known_item = (
         "allthetweaks:atm_star" in evidence
-        and bool(re.search(r"没有.{0,20}(?:ATM.?星|ATM之星).{0,20}物品|不存在.{0,20}(?:ATM.?星|ATM之星)", answer, re.IGNORECASE))
+        and bool(_DENIES_EVIDENCE_CONFIRMED_ATM_STAR.search(answer))
     )
-    if not incomplete and not invented_ids and not reversed_task_relation and not denies_known_item:
+    issues: list[str] = []
+    if incomplete:
+        issues.append("incomplete_follow_up")
+    if invented_ids:
+        issues.append("unverified_identifier")
+    if reversed_task_relation:
+        issues.append("reversed_task_reward_relation")
+    if denies_known_item:
+        issues.append("contradicts_confirmed_item")
+    if not issues:
+        return AnswerValidation(AnswerValidationStatus.PASS)
+    status = (
+        AnswerValidationStatus.INCOMPLETE
+        if incomplete and not (invented_ids or reversed_task_relation or denies_known_item)
+        else AnswerValidationStatus.UNSUPPORTED_CLAIM
+    )
+    return AnswerValidation(status, tuple(issues), tuple(sorted(invented_ids)))
+
+
+def _validated_research_answer(
+    answer: str,
+    messages: list[dict[str, Any]],
+    *,
+    additional_evidence: str = "",
+) -> str:
+    validation = _validate_research_answer(
+        answer, messages, additional_evidence=additional_evidence,
+    )
+    if validation.status == AnswerValidationStatus.PASS:
         return answer
-    return (
-        "这轮检索没有拿到足以核实精确配方的完整证据，所以我不直接列材料，避免把相似物品或任务奖励当成配方。\n\n"
-        "可以先在 JEI/EMI 搜索物品 ID allthetweaks:atm_star，悬停后按 R 查看当前整合包版本的制作方式；"
-        "再打开 FTB 任务书的 ATM Star 章节，按前置任务准备各路线材料。ATM10 更新可能调整配方，游戏内 JEI/EMI 和任务书比旧攻略可靠。\n\n"
-        "如果把 JEI 配方页截图或具体 ATM10 版本号发出来，我可以继续拆解每项材料的获取路线。"
+
+    evidence = "\n".join(
+        str(message.get("content") or "")
+        for message in messages
+        if message.get("role") == "tool"
     )
+    evidence = (evidence + "\n" + additional_evidence).lower()
+    kept: list[str] = []
+    # Remove only the offending sentence/fragment; preserve unrelated useful text.
+    for segment in re.split(r"(?<=[。！？!?；;])|\n+", answer):
+        text = segment.strip()
+        if not text:
+            continue
+        ids = {
+            value.lower() for value in _NAMESPACE_IDENTIFIER.findall(text)
+            if value.lower().split(":", 1)[0] not in {"http", "https", "ftp"}
+        }
+        if any(identifier not in evidence for identifier in ids):
+            continue
+        if any(re.search(pattern, text, re.IGNORECASE) for pattern in _INCOMPLETE_ANSWER_PATTERNS):
+            continue
+        if "关系检测：目标作为任务要求" in evidence and _REVERSED_TASK_RELATION.search(text):
+            continue
+        if "allthetweaks:atm_star" in evidence and _DENIES_EVIDENCE_CONFIRMED_ATM_STAR.search(text):
+            continue
+        kept.append(text)
+
+    issue_set = set(validation.issues)
+    notes: list[str] = []
+    if "unverified_identifier" in issue_set:
+        notes.append("有些精确物品标识没有在本轮来源中核实，相关说法先不作为已确认信息。")
+    if "reversed_task_reward_relation" in issue_set:
+        notes.append("来源显示任务要求与奖励的关系不同，原回答中相关说法已去掉。")
+    if "contradicts_confirmed_item" in issue_set:
+        notes.append("来源中出现了该物品，原回答里与来源相反的否定说法已去掉。")
+    if "incomplete_follow_up" in issue_set:
+        notes.append("原回答提到的后续核查这轮没有完成，不能把它算作已核实结果。")
+    if not kept:
+        notes.append("目前没有足够依据给出这部分精确信息。")
+    return "\n\n".join([*notes, "".join(kept).strip()]).strip()

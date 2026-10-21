@@ -6,7 +6,7 @@ from dataclasses import replace
 from unittest.mock import patch
 
 from app.llm import ChatWithToolsResponse, ToolCallRequest
-from app.progress.commentary import PUBLIC_COMMENTARY_TOOL
+from app.progress.commentary import PUBLIC_COMMENTARY_TOOL, public_commentary_spec
 from app.progress.coordinator import ProgressCoordinator
 from app.progress.events import (
     AgentEventKind,
@@ -21,7 +21,7 @@ from app.progress.events import (
 from app.progress.reporter import FinalDeliveryStatus, QQProgressReporter
 from app.qq_dispatcher import QQMessageDispatcher
 from app.tools.agent import TOOL_REGISTRY, agent_tool_schemas, run_agent_loop
-from app.tools.contracts import PolicySnapshot, ToolResult, ToolStatus
+from app.tools.contracts import PolicySnapshot, ToolContext, ToolResult, ToolStatus
 from tests.test_progress_coordinator import FakeClock
 
 
@@ -110,6 +110,28 @@ class PublicCommentaryContractTests(unittest.TestCase):
 
 
 class PublicCommentaryAgentIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_plan_is_rejected_after_application_plan_was_announced(self) -> None:
+        identity = TaskIdentity.create(
+            request_id="announced-plan", group_id="g1", user_id="u1", epoch=1,
+            origin="user_message",
+        )
+        coordinator = ProgressCoordinator(clock=FakeClock())
+        sink = coordinator.register(identity)
+        plan = PublicCommentary(CommentaryKind.PLAN, "我先查资料，再整理答案。", identity.task_id, 1)
+        self.assertTrue(sink.emit(AgentEventKind.PUBLIC_COMMENTARY, round_index=1, commentary=plan))
+        context = ToolContext(
+            request_id=identity.request_id, group_id=identity.group_id, user_id=identity.user_id,
+            task_identity=identity, event_sink=sink, tool_call_id="duplicate-plan",
+            agent_round=1, extensions={"agent_plan_publicly_announced": True},
+        )
+        result = await public_commentary_spec().handler(context, {
+            "kind": "plan", "text": "我会按步骤处理：查资料；再整理答案。",
+        })
+        self.assertEqual(result.status, ToolStatus.INVALID_ARGUMENT)
+        self.assertEqual(coordinator.metrics["commentary_accepted"], 1)
+        self.assertEqual(coordinator.metrics["commentary_rejected"], 0)
+        await coordinator.aclose()
+
     async def test_fast_plan_and_tool_completion_are_suppressed_before_three_seconds(self) -> None:
         clock = FakeClock()
         coordinator = ProgressCoordinator(clock=clock)

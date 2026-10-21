@@ -262,9 +262,26 @@ class TaskPlan:
         )
 
     def public_summary(self) -> str:
-        descriptions = [step.description.strip() for step in self.steps[:4]]
-        suffix = "；后续步骤将根据结果调整。" if len(self.steps) > 4 else "。"
-        return ("我会按计划处理：" + "；".join(descriptions) + suffix)[:240]
+        """Project real plan actions into a short public sentence, without IDs/state."""
+        descriptions = [
+            re.sub(r"\s+", " ", step.description).strip().rstrip("。.!！?？;；")
+            for step in self.steps[:4]
+        ]
+        descriptions = [item for item in descriptions if item]
+        if not descriptions:
+            return "我先确认一下需要处理的内容。"
+        if len(descriptions) == 1:
+            text = f"我先{descriptions[0]}。"
+        elif len(descriptions) == 2:
+            text = f"我先{descriptions[0]}，然后{descriptions[1]}。"
+        elif len(descriptions) == 3:
+            text = f"我先{descriptions[0]}，接着{descriptions[1]}，最后{descriptions[2]}。"
+        else:
+            text = (
+                f"我先{descriptions[0]}，接着{descriptions[1]}，"
+                f"再{descriptions[2]}，最后{descriptions[3]}。"
+            )
+        return text[:237].rstrip("，、； ") + ("…" if len(text) > 240 else "")
 
     @property
     def is_complete(self) -> bool:

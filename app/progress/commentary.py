@@ -9,6 +9,7 @@ from app.progress.events import (
     TaskIdentity,
     ToolCategory,
 )
+from app.prompts import PUBLIC_COMMENTARY_TOOL_RULES
 from app.tools.contracts import (
     ToolAccess,
     ToolContext,
@@ -98,6 +99,8 @@ def public_commentary_spec() -> ToolSpec:
             outcomes = {}
         if kind == CommentaryKind.PLAN and refs:
             return _invalid("A plan must not claim completed tool results.")
+        if kind == CommentaryKind.PLAN and context.extensions.get("agent_plan_publicly_announced"):
+            return _invalid("The application has already published this task plan.")
         if kind == CommentaryKind.PLAN and (context.agent_round != 1 or outcomes):
             return _invalid("A public plan is only allowed before this task executes domain tools.")
         if kind != CommentaryKind.PLAN:
@@ -133,15 +136,7 @@ def public_commentary_spec() -> ToolSpec:
 
     return ToolSpec(
         name=PUBLIC_COMMENTARY_TOOL,
-        description=(
-            "Publish one short, user-visible progress sentence for a genuinely multi-step task. "
-            "Use kind=plan only for intended future actions. For update/revision/blocked, reference "
-            "completed tool_call IDs from this request in related_tool_call_ids. This control tool "
-            "does not execute work, provide evidence, or grant permissions. Do not expose chain of thought, "
-            "raw arguments, search queries, URLs, private facts, secrets, or claim work that has not completed. "
-            "When practical, pair it with substantive work in the same model response; do not make commentary-only calls. "
-            "Skip it for simple requests and ordinary answers."
-        ),
+        description=PUBLIC_COMMENTARY_TOOL_RULES,
         parameters=PUBLIC_COMMENTARY_SCHEMA,
         handler=publish,
         policy=ToolPolicy(access=ToolAccess.READ_ONLY, allowed_roles=frozenset({"group_member"})),

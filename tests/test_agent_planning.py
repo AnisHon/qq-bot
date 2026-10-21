@@ -19,7 +19,7 @@ from app.planning.contracts import (
     PlanAssessment, PlanStep, StepStatus, TaskComplexity, TaskPlan,
 )
 from app.planning.controller import PlanExecutionController
-from app.planning.planner import assess_task_complexity, generate_task_plan
+from app.planning.planner import PLANNER_SYSTEM, REPLAN_SYSTEM, assess_task_complexity, generate_task_plan
 from app.progress.events import AgentEventKind, CommentaryKind, RequestAgentEventSink, TaskIdentity
 from app.tools.agent import TOOL_REGISTRY, run_agent_loop
 from app.tools.contracts import Evidence, PolicySnapshot, ToolResult, ToolStatus
@@ -130,6 +130,38 @@ class ComplexityAndSchemaTests(unittest.TestCase):
         for text in ("not json", '{"steps": []} trailing', "[]"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 decode_plan_json(text)
+
+    def test_public_plan_is_natural_projection_without_internal_plan_language(self) -> None:
+        plan = TaskPlan.from_draft(
+            task_id="public-plan", goal="查 GTNH 铂处理并设计自动化", constraints=(),
+            draft={"steps": [
+                {"step_id": "find", "description": "查找 GTNH 铂处理资料", "dependencies": [],
+                 "completion_criteria": "取得相关来源", "required_evidence": ["source"],
+                 "tool_names": ["knowledge_search"]},
+                {"step_id": "verify", "description": "核对版本与关键配方", "dependencies": ["find"],
+                 "completion_criteria": "取得版本匹配的配方来源", "required_evidence": ["recipe", "version"],
+                 "tool_names": ["recipe_query"]},
+                {"step_id": "design", "description": "整理机器和物料流程", "dependencies": ["verify"],
+                 "completion_criteria": "形成基于已核对配方的方案", "required_evidence": ["model_assessment"],
+                 "tool_names": []},
+            ]},
+            allowed_tools=frozenset({"knowledge_search", "recipe_query"}),
+        )
+        summary = plan.public_summary()
+        self.assertIn("我先查找 GTNH 铂处理资料", summary)
+        self.assertIn("接着核对版本与关键配方", summary)
+        self.assertIn("最后整理机器和物料流程", summary)
+        self.assertNotIn("按计划处理", summary)
+        self.assertNotIn("step_id", summary)
+        self.assertNotIn("revision", summary)
+        self.assertLessEqual(len(summary), 240)
+
+    def test_planner_protocol_keeps_machine_schema_and_user_language_description(self) -> None:
+        for prompt in (PLANNER_SYSTEM, REPLAN_SYSTEM):
+            self.assertIn("JSON", prompt)
+            self.assertIn("step_id", prompt)
+            self.assertIn("用户当前语言", prompt)
+            self.assertIn("不要输出思维过程", prompt)
 
 
 class PlanPersistenceAndControllerTests(unittest.IsolatedAsyncioTestCase):
@@ -657,6 +689,17 @@ class PlanningAgentIntegrationTests(unittest.IsolatedAsyncioTestCase):
             event.kind == AgentEventKind.PUBLIC_COMMENTARY
             and event.commentary.kind == CommentaryKind.PLAN for event in events
         ))
+        public_updates = [
+            event.commentary.text for event in events
+            if event.kind == AgentEventKind.PUBLIC_COMMENTARY
+            and event.commentary is not None
+            and event.commentary.kind == CommentaryKind.UPDATE
+        ]
+        self.assertTrue(public_updates)
+        self.assertTrue(all(
+            not any(term in text for term in ("计划状态", "已标记完成", "WorkingState", "checkpoint", "revision"))
+            for text in public_updates
+        ))
         self.assertTrue(any(event.kind == AgentEventKind.PLAN_STEP_UPDATED for event in events))
         self.assertTrue(all(
             "plan_step_assess" in {item["function"]["name"] for item in schemas}
@@ -666,7 +709,7 @@ class PlanningAgentIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_news_no_results_replans_and_final_answer_is_marked_partial(self) -> None:
         reply, state, llm, _events, _tools = await self._run_fixture(no_results=True)
-        self.assertIn("任务未完全完成", reply)
+        self.assertIn("还有要求没能核实完", reply)
         self.assertIn("不会编造来源", reply)
         self.assertEqual(llm.plan_calls, 1)
         self.assertEqual(state.status, "completed")

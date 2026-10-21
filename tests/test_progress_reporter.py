@@ -175,7 +175,7 @@ class ProgressReporterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_renderer_uses_only_bounded_static_event_projection(self) -> None:
         text = render_progress(self.candidate(self.identity()))
-        self.assertIn("网页搜索", text)
+        self.assertIn("网页资料", text)
         self.assertIn("无结果", text)
         self.assertNotIn("message-1", text)
         self.assertLessEqual(len(text), 240)
@@ -194,7 +194,7 @@ class ProgressReporterTests(unittest.IsolatedAsyncioTestCase):
             expires_monotonic=candidate.expires_monotonic,
             notice_number=candidate.notice_number,
         )
-        self.assertEqual(render_progress(candidate), "正在生成回复……")
+        self.assertEqual(render_progress(candidate), "我在结合已有上下文整理答复……")
 
     async def test_untrusted_category_text_cannot_be_rendered_as_progress(self) -> None:
         base = self.candidate(self.identity())
@@ -215,7 +215,7 @@ class ProgressReporterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", text)
         self.assertNotIn("hidden", text)
         self.assertNotIn("[CQ:", text)
-        self.assertIn("相关工具", text)
+        self.assertIn("相关内容", text)
 
     async def test_global_progress_attempt_rate_is_bounded_without_limiting_final(self) -> None:
         for index in range(31):
